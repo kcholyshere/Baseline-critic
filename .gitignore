@@ -93,4 +93,7 @@ target/
 /models/
 
 # exclude data from source control by default
-# /data/
+/data/
+
+# agent-only docs, not for source control
+/agent_docs/

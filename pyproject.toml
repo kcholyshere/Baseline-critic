@@ -1,0 +1,15 @@
+[project]
+name = "baseline-critic"
+version = "0.1.0"
+description = "Baseline Model Agent: profiles a tabular dataset, trains baselines, and critiques results for leakage"
+requires-python = ">=3.13"
+dependencies = [
+    "google-adk>=2.7.1,<3",
+    "ipykernel>=6.30.0,<7",
+    "langfuse>=4.14.5",
+    "lightgbm>=4.7.0",
+    "openinference-instrumentation-google-adk>=0.1.23",
+    "pandas>=3.0.5",
+    "python-dotenv>=1.2.2,<2",
+    "scikit-learn>=1.9.0",
+]
