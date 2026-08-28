@@ -28,6 +28,7 @@ class RunReport:
     holdout_accuracy: float
     classification_report: dict[str, Any]
     duration_seconds: float
+    positive_class: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
