@@ -27,4 +27,4 @@ Live task list: agent_docs/TODOS.md. Full decision log with rationale: agent_doc
 
 ## Critical rules
 - Commit and push at reasonable intervals
-- Presentation today (2026-08-28, 12:30): need shareworthy, demoable progress under time pressure. Deliver as much as possible, but keep it explainable - don't outrun what can be walked through without a big comprehension debt. A working UI layer is required for the demo.
+- Final project due Monday 2026-09-07. Deliver as much as possible, but keep it explainable - don't outrun what can be walked through without a big comprehension debt.
