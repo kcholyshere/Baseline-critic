@@ -63,22 +63,6 @@ Notes:
 
 ## Final product would add
 
-```mermaid
-flowchart TD
-    Start(["Dataset + target column"]) --> Plan["Planner/modeller agent"]
-    Plan -->|"proposes features and training code"| CodeExec["Code execution tool"]
-    CodeExec --> Score["Scoring tool: fixed holdout split"]
-    Score --> Critique["Critic agent: different information, reviews for leakage"]
-    Critique -->|"names a defect"| Plan
-    Critique -->|"accepted"| Report["Report tool: renders the run as a document"]
-    Report --> End(["Winning model + written account of what was tried"])
-
-    HardCap["Hard cap: training runs per session"] -.bounds.-> CodeExec
-    SoftCap["Soft cap: critique rounds per request"] -.bounds.-> Critique
-```
-
-Notes:
-
 - Profiling already exists and already feeds the single agent's prompt today - what's new here is splitting that one agent into two.
 - The one agent splits into two: a planner/modeller that proposes and builds, and a critic that reviews. They get different information on purpose, so the critic cannot just agree with the modeller's framing.
 - The loop can revise: a named defect sends the modeller back to try again, not just a pass or fail.
