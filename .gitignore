@@ -97,3 +97,6 @@ target/
 
 # agent-only docs, not for source control
 /agent_docs/
+
+# machine-local skill symlinks (e.g. into .venv package skills), not project source
+.claude/skills/
