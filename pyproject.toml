@@ -8,6 +8,8 @@ dependencies = [
     "ipykernel>=6.30.0,<7",
     "langfuse>=4.14.5",
     "lightgbm>=4.7.0",
+    "litellm>=1.99.0",
+    "mcp[cli]<2",
     "openinference-instrumentation-google-adk>=0.1.23",
     "pandas>=3.0.5",
     "python-dotenv>=1.2.2,<2",

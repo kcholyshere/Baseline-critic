@@ -7,7 +7,7 @@ The Baseline Model Agent: point it at a tabular dataset and a target column, and
 Anyone can wire an LLM to scikit-learn. The interesting design problem is the reviewer: an agent whose success is measured by rejecting work, given different information from the agent that produced it, bounded so it cannot argue forever. The business case is cost optimisation - analyst days saved per dataset, and the more expensive cost avoided: a leaked score reaching production before anyone notices.
 
 ## How
-- Agent framework: Google ADK. LLM: `gemini-3.7-flash` via Vertex AI, ADC auth, no API keys (ADR-002).
+- Agent framework: Google ADK. LLM: local only, `qwen2.5-coder:14b` via Ollama + LiteLLM (`config.DEFAULT_MODEL_URI`, ADR-008, supersedes ADR-002's Gemini pick). No cloud LLM call, no API key - this is a strict requirement, not a preference; there is no cloud fallback. The agent's instruction injects the real installed `lightgbm.train` signature directly (not an optional tool) and allows a bounded retry against its own runtime errors - both needed in practice (references/local-model-benchmarks.md).
 - Data/modelling: pandas, scikit-learn + LightGBM.
 - Code execution: agent-generated feature/training code runs in an isolated subprocess with a throwaway scratch directory, not a container - `src/services/code_execution.py` (ADR-001, ADR-003).
 - Observability: Langfuse via OpenTelemetry (`openinference-instrumentation-google-adk`), wired in `src/services/observability.py` before any `Agent` is constructed, so every entrypoint imports it once (ADR-000).
@@ -28,3 +28,4 @@ Live task list: agent_docs/TODOS.md. Full decision log with rationale: agent_doc
 ## Critical rules
 - Commit and push at reasonable intervals
 - Final project due Monday 2026-09-07. Deliver as much as possible, but keep it explainable - don't outrun what can be walked through without a big comprehension debt.
+- Keep agent_docs/TODOS.md current automatically, without being asked: check off an item the moment it's done, add new ones as they come up. It is not a documentation file - one line per item, plain checkboxes under the phase headings, no extra formatting or explanation.

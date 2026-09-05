@@ -1,6 +1,5 @@
 """Project-wide configuration constants."""
 
-import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -13,12 +12,9 @@ RAW_DATA_DIR = DATA_DIR / "raw"
 INTERIM_DATA_DIR = DATA_DIR / "interim"
 PROCESSED_DATA_DIR = DATA_DIR / "processed"
 
-# Vertex AI auth (no API keys - relies on Application Default Credentials).
-# ADK reads GOOGLE_GENAI_USE_VERTEXAI/GOOGLE_CLOUD_PROJECT/GOOGLE_CLOUD_LOCATION
-# from the environment itself; these mirrors are for our own modules.
-GCP_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
-GCP_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
-
-# Verified 2026-08-26 with a direct generate_content call against
-# gd-gcp-internship-ds's live Vertex AI catalogue.
-GEMINI_MODEL = "gemini-3.7-flash"
+# Local-only model, via Ollama + LiteLLM - no cloud LLM call, no API key
+# (ADR-008, supersedes ADR-002's Gemini pick). "ollama_chat/", not "ollama/":
+# LiteLLM's ollama_chat provider uses Ollama's OpenAI-compatible chat
+# endpoint, the one that carries tool-calling correctly (verified 2026-09-05,
+# references/local-model-benchmarks.md).
+DEFAULT_MODEL_URI = "ollama_chat/qwen2.5-coder:14b"

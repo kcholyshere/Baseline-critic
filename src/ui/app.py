@@ -10,13 +10,15 @@ Not the planner/modeller/critic loop the proposal describes. Binary
 classification only.
 """
 
+import asyncio
+
 import pandas as pd
 import streamlit as st
 
-from src import dataset
-from src.agent import run_baseline, run_baseline_for
+from src import config, dataset, evaluation
+from src.agent import rescore_run_async, run_baseline, run_baseline_for
 from src.profiling import profile_dataframe
-from src.report import RunReport, list_runs
+from src.report import RunReport, list_runs, save_rescoring
 
 st.set_page_config(
     page_title="Baseline critic",
@@ -85,6 +87,51 @@ def _render_report(report: RunReport) -> None:
         st.metric("Holdout rows", report.holdout_rows, border=True)
         st.metric("Run time", f"{report.duration_seconds:.1f}s", border=True)
 
+    critic_tokens = (report.critique or {}).get("prompt_tokens", 0) + (report.critique or {}).get(
+        "completion_tokens", 0
+    )
+    modeller_tokens = report.modeller_prompt_tokens + report.modeller_completion_tokens
+    with st.container(horizontal=True):
+        st.metric("Modeller tokens", modeller_tokens, border=True)
+        st.metric("Critic tokens", critic_tokens, border=True)
+        st.metric("Training attempts", report.attempts, border=True)
+        if report.critique is not None:
+            st.metric("Critique rounds", report.critique["rounds_used"], border=True)
+
+    if report.critique is not None:
+        with st.container(horizontal=True, vertical_alignment="center"):
+            if report.critique["verdict"] == "accept":
+                st.badge("Critic: accepted", icon=":material/check_circle:", color="green")
+            else:
+                st.badge(
+                    f"Critic: rejected - {report.critique['defect_category']}",
+                    icon=":material/gpp_maybe:",
+                    color="red",
+                )
+            if report.dataset_name == "breast_cancer_wisconsin":
+                if st.button("Re-score", icon=":material/refresh:", key=f"rescore_{report.run_id}"):
+                    with st.spinner("Re-running static checks and critic on the stored run...", show_time=True):
+                        dataset.build_train_artifact()
+                        new_critique = asyncio.run(rescore_run_async(report, dataset.TRAIN_PATH))
+                        save_rescoring(report.run_id, new_critique.to_dict(), config.DEFAULT_MODEL_URI)
+                    st.toast("Re-scored - see the panel below", icon=":material/check_circle:")
+                    st.session_state[f"rescore_result_{report.run_id}"] = new_critique.to_dict()
+
+        rescore_result = st.session_state.get(f"rescore_result_{report.run_id}")
+        if rescore_result is not None:
+            with st.expander("Latest re-score result", icon=":material/history:", expanded=True):
+                st.caption(
+                    "Computed just now from the stored code and results, without re-running the "
+                    "modeller agent - the original verdict above is unchanged."
+                )
+                verdict_label = (
+                    "accept" if rescore_result["verdict"] == "accept" else f"reject - {rescore_result['defect_category']}"
+                )
+                st.markdown(f"**Verdict:** {verdict_label}")
+                if rescore_result["defect"]:
+                    st.markdown(f"**Defect:** {rescore_result['defect']}")
+                st.caption(rescore_result["evidence"])
+
     col_report, col_meta = st.columns([3, 2])
     with col_report:
         with st.container(border=True):
@@ -115,8 +162,94 @@ def _render_report(report: RunReport) -> None:
     st.caption("The exact script the agent wrote and ran in the code-execution sandbox.")
     st.code(report.generated_code, language="python", line_numbers=True)
 
+    if report.critique is not None and report.critique["verdict"] == "reject":
+        with st.expander("Critic's defect", icon=":material/gpp_maybe:", expanded=True):
+            st.markdown(f"**{report.critique['defect']}**")
+            st.caption(report.critique["evidence"])
+            if report.critique["static_findings"]:
+                st.markdown("Deterministic static-check findings:")
+                for finding in report.critique["static_findings"]:
+                    st.markdown(f"- {finding}")
+
     with st.expander("Sandbox stdout", icon=":material/terminal:"):
         st.code(report.stdout or "(no output)", language="text")
+
+
+def _render_evaluation_tab() -> None:
+    st.caption(
+        "Phase 5: plants one known defect per defect_category into the Breast Cancer Wisconsin "
+        "dataset and measures the critic's detection rate against its false-alarm rate on a "
+        "clean run - see ADR-010 and references/project-proposal.md."
+    )
+    if st.button("Run evaluation now", icon=":material/science:", key="run_evaluation_button"):
+        with st.spinner(
+            "Scoring the critic against every defect fixture - this takes several minutes...", show_time=True
+        ):
+            evaluation.run_evaluation()
+        st.toast("Evaluation complete", icon=":material/check_circle:")
+        st.rerun()
+
+    summary = evaluation.load_latest_summary()
+    if summary is None:
+        st.info(
+            "No evaluation run yet. Click **Run evaluation now**, or run "
+            "`uv run python -m scripts.run_evaluation` from the command line.",
+            icon=":material/info:",
+        )
+        return
+
+    st.caption(
+        f"Last run: {summary['generated_at'][:19].replace('T', ' ')}  ·  model: {summary['model']}  ·  "
+        f"{summary['trials_per_fixture']} critic trials per category"
+    )
+    with st.container(horizontal=True):
+        st.metric("Detection rate", f"{summary['overall_detection_rate']:.0%}", border=True)
+        st.metric("False-alarm rate", f"{summary['overall_false_alarm_rate']:.0%}", border=True)
+        st.metric("Prompt tokens", summary["total_prompt_tokens"], border=True)
+        st.metric("Completion tokens", summary["total_completion_tokens"], border=True)
+
+    rows = [
+        {
+            "category": row["defect_category"],
+            "ground truth": row["ground_truth_verdict"],
+            "static check fired": "yes" if row["static_findings"] else "no",
+            "LLM-only reject rate": row["llm_only_reject_rate"],
+            "combined reject rate": row["combined_reject_rate"],
+            "holdout accuracy": row["holdout_accuracy"],
+        }
+        for row in summary["categories"]
+    ]
+    st.dataframe(
+        pd.DataFrame(rows).set_index("category"),
+        width="stretch",
+        column_config={
+            "LLM-only reject rate": st.column_config.NumberColumn(format="%.2f"),
+            "combined reject rate": st.column_config.NumberColumn(format="%.2f"),
+            "holdout accuracy": st.column_config.NumberColumn(format="%.4f"),
+        },
+    )
+    st.caption(
+        "target_leakage and temporal_leakage have no deterministic static check (src/checks.py) - "
+        "their reject rate is the critic's own judgement, not the checks running alongside it."
+    )
+
+    with st.expander("Fixture descriptions"):
+        for row in summary["categories"]:
+            st.markdown(f"**{row['defect_category']}** ({row['ground_truth_verdict']}): {row['description']}")
+
+    clean_row = next((r for r in summary["categories"] if r["ground_truth_verdict"] == "accept"), None)
+    if clean_row and clean_row["rejecting_trials"]:
+        with st.expander(
+            f"Why the critic rejected the clean run ({len(clean_row['rejecting_trials'])}/"
+            f"{clean_row['n_trials']} trials)",
+            icon=":material/warning:",
+        ):
+            st.caption(
+                "The false-alarm rate above is only useful once you know what the critic "
+                "actually objected to on a run with no real defect."
+            )
+            for trial in clean_row["rejecting_trials"]:
+                st.markdown(f"- **{trial['defect_category']}**: {trial['defect']}")
 
 
 st.html("""
@@ -214,22 +347,28 @@ with st.sidebar:
         )
         st.session_state["selected_run_id"] = selected_id
 
-if upload_profile is not None:
-    with st.container(border=True):
-        st.subheader(f"Dataset profile: {upload_file_name}", anchor=False)
-        st.caption(
-            f"{upload_profile['row_count']} rows, {len(upload_profile['features'])} feature columns. "
-            f"Target '{upload_target_column}' balance: {upload_profile['target']['value_counts']}"
-        )
-        st.dataframe(_profile_df(upload_profile), width="stretch")
-    st.divider()
+tab_run, tab_evaluation = st.tabs(["Run", "Evaluation harness"])
 
-if not runs:
-    st.info(
-        "No runs yet. Click **Run baseline** in the sidebar to train the first one.",
-        icon=":material/info:",
-    )
-else:
-    selected_id = st.session_state.get("selected_run_id", runs[0].run_id)
-    selected_report = next((r for r in runs if r.run_id == selected_id), runs[0])
-    _render_report(selected_report)
+with tab_run:
+    if upload_profile is not None:
+        with st.container(border=True):
+            st.subheader(f"Dataset profile: {upload_file_name}", anchor=False)
+            st.caption(
+                f"{upload_profile['row_count']} rows, {len(upload_profile['features'])} feature columns. "
+                f"Target '{upload_target_column}' balance: {upload_profile['target']['value_counts']}"
+            )
+            st.dataframe(_profile_df(upload_profile), width="stretch")
+        st.divider()
+
+    if not runs:
+        st.info(
+            "No runs yet. Click **Run baseline** in the sidebar to train the first one.",
+            icon=":material/info:",
+        )
+    else:
+        selected_id = st.session_state.get("selected_run_id", runs[0].run_id)
+        selected_report = next((r for r in runs if r.run_id == selected_id), runs[0])
+        _render_report(selected_report)
+
+with tab_evaluation:
+    _render_evaluation_tab()
