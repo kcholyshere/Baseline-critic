@@ -35,7 +35,6 @@ proxy rather than declaring the category untestable.
 
 import asyncio
 import hashlib
-import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -47,7 +46,7 @@ from google.adk.models.lite_llm import LiteLlm
 
 from src import config, dataset
 from src.agent import build_run_report_from_execution
-from src.checks import evidence_categories, run_static_checks
+from src.checks import run_checks
 from src.critic import Critique, critique_run_async
 from src.profiling import format_profile_for_prompt, profile_dataframe
 from src.report import RunReport, _atomic_write_json, _read_json_or_none
@@ -348,13 +347,20 @@ def load_or_build_fixture_report(spec: FixtureSpec, rebuild: bool = False) -> Ru
     (ADR-003, MAX_CALLS_PER_SESSION)."""
     cache_path = _fixture_cache_path(spec.category)
     if not rebuild and cache_path.exists():
-        return RunReport(**json.loads(cache_path.read_text())["report"])
+        cached = _read_json_or_none(cache_path)
+        if cached is not None:
+            return RunReport(**cached["report"])
+        # An interrupted --rebuild can leave a truncated cache file. Rather
+        # than crash every later run with an uncaught JSONDecodeError, treat
+        # this the same as a cache miss and rebuild.
     report = _build_fixture_report(spec)
-    cache_path.write_text(
-        json.dumps(
-            {"ground_truth_verdict": spec.ground_truth_verdict, "description": spec.description, "report": report.to_dict()},
-            indent=2,
-        )
+    _atomic_write_json(
+        cache_path,
+        {
+            "ground_truth_verdict": spec.ground_truth_verdict,
+            "description": spec.description,
+            "report": report.to_dict(),
+        },
     )
     return report
 
@@ -366,10 +372,18 @@ class FixtureOutcome:
     description: str
     holdout_accuracy: float
     static_findings: list[str]
+    # The defect_category values a static check actually found real evidence
+    # for (src.checks.StaticFinding.category) - distinct from static_findings
+    # being non-empty, which also includes confirmation-only text with no
+    # category (ADR-016's evidence_categories() concept, kept here as data
+    # rather than recomputed by every reader).
+    static_evidence_categories: set[str] = field(default_factory=set)
     trials: list[Critique] = field(default_factory=list)
 
     @property
-    def combined_reject_rate(self) -> float:
+    def combined_reject_rate(self) -> float | None:
+        if not self.trials:
+            return None
         return sum(1 for t in self.trials if t.verdict == "reject") / len(self.trials)
 
     @property
@@ -401,16 +415,13 @@ async def _run_fixture_trials(
 ) -> FixtureOutcome:
     train_df, _ = get_fixture_train_holdout(spec)
     train_path = fixture_train_path(spec.category)
-    static_findings = run_static_checks(
-        report.generated_code, train_path, dataset.TARGET_COLUMN, report.stdout, report.holdout_accuracy
-    )
-    static_evidence = evidence_categories(
+    static_findings = run_checks(
         report.generated_code, train_path, dataset.TARGET_COLUMN, report.stdout, report.holdout_accuracy
     )
     profile_text = format_profile_for_prompt(profile_dataframe(train_df, dataset.TARGET_COLUMN))
 
     trials = [
-        await critique_run_async(report, profile_text, static_findings, model, static_evidence)
+        await critique_run_async(report, profile_text, static_findings, model)
         for _ in range(trials_per_fixture)
     ]
     return FixtureOutcome(
@@ -418,12 +429,18 @@ async def _run_fixture_trials(
         ground_truth_verdict=spec.ground_truth_verdict,
         description=spec.description,
         holdout_accuracy=report.holdout_accuracy,
-        static_findings=static_findings,
+        static_findings=[f.text for f in static_findings],
+        static_evidence_categories={f.category for f in static_findings if f.category is not None},
         trials=trials,
     )
 
 
-def _build_summary(outcomes: list[FixtureOutcome], trials_per_fixture: int, model_name: str) -> dict:
+def _build_summary(
+    outcomes: list[FixtureOutcome],
+    trials_per_fixture: int,
+    model_name: str,
+    failed_fixtures: list[dict] | None = None,
+) -> dict:
     rows = []
     total_prompt_tokens = 0
     total_completion_tokens = 0
@@ -439,6 +456,12 @@ def _build_summary(outcomes: list[FixtureOutcome], trials_per_fixture: int, mode
                 "ground_truth_verdict": outcome.ground_truth_verdict,
                 "holdout_accuracy": outcome.holdout_accuracy,
                 "static_findings": outcome.static_findings,
+                # Which defect_category values a static check found real
+                # evidence for - distinct from static_findings being
+                # non-empty, which also includes confirmation-only text with
+                # no category (ADR-016's evidence_categories() concept). This
+                # is what "did a static check catch this" should mean.
+                "static_evidence_categories": sorted(outcome.static_evidence_categories),
                 "n_trials": len(outcome.trials),
                 "combined_reject_rate": outcome.combined_reject_rate,
                 "llm_only_reject_rate": outcome.llm_only_reject_rate,
@@ -460,18 +483,28 @@ def _build_summary(outcomes: list[FixtureOutcome], trials_per_fixture: int, mode
         )
 
     reject_rows = [r for r in rows if r["ground_truth_verdict"] == "reject"]
-    clean_row = next(r for r in rows if r["ground_truth_verdict"] == "accept")
-    detection_rate = sum(r["combined_reject_rate"] for r in reject_rows) / len(reject_rows) if reject_rows else None
+    clean_row = next((r for r in rows if r["ground_truth_verdict"] == "accept"), None)
+    # combined_reject_rate is None only when a fixture's trial list is empty
+    # (see FixtureOutcome.combined_reject_rate) - excluded here rather than
+    # summed, so one such row can't turn the whole detection rate into a
+    # TypeError.
+    reject_rates = [r["combined_reject_rate"] for r in reject_rows if r["combined_reject_rate"] is not None]
+    detection_rate = sum(reject_rates) / len(reject_rates) if reject_rates else None
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "trials_per_fixture": trials_per_fixture,
         "model": model_name,
         "overall_detection_rate": detection_rate,
-        "overall_false_alarm_rate": clean_row["combined_reject_rate"],
+        "overall_false_alarm_rate": clean_row["combined_reject_rate"] if clean_row is not None else None,
         "total_prompt_tokens": total_prompt_tokens,
         "total_completion_tokens": total_completion_tokens,
         "categories": rows,
+        # Fixtures whose sandbox build raised (e.g. TrainingBudgetExceeded)
+        # before any critic trial could run - kept distinct from `categories`
+        # so a reader can see which categories are simply missing from this
+        # run's numbers, rather than the failure being swallowed silently.
+        "failed_fixtures": failed_fixtures or [],
     }
 
 
@@ -501,12 +534,26 @@ async def run_evaluation_async(
     model_name = model if isinstance(model, str) else model.model
 
     outcomes = []
+    failed_fixtures = []
     for spec in FIXTURES:
-        report = load_or_build_fixture_report(spec, rebuild=rebuild)
+        try:
+            # Scoped to the build step only: this is where run_code can raise
+            # TrainingBudgetExceeded (or any other sandbox failure) during
+            # --rebuild. src.agent's _run_baseline_async already leaves a
+            # failure RunReport on disk for the live-agent path; this fixture
+            # path calls run_code directly (see _build_fixture_report), so
+            # this is the only place that failure is recorded for the
+            # harness. Deliberately not wrapping _run_fixture_trials below:
+            # a critic/LLM failure there is a different, unrelated failure
+            # mode this fix isn't meant to mask.
+            report = load_or_build_fixture_report(spec, rebuild=rebuild)
+        except Exception as exc:
+            failed_fixtures.append({"defect_category": spec.category, "error": f"{type(exc).__name__}: {exc}"})
+            continue
         outcome = await _run_fixture_trials(report, spec, trials_per_fixture, model)
         outcomes.append(outcome)
 
-    summary = _build_summary(outcomes, trials_per_fixture, model_name)
+    summary = _build_summary(outcomes, trials_per_fixture, model_name, failed_fixtures)
     _save_summary(summary)
     return summary
 

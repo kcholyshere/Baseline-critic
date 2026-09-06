@@ -86,7 +86,12 @@ def _profile_df(profile: dict) -> pd.DataFrame:
 
 
 def _run_label(report: RunReport) -> str:
-    return f"{report.timestamp[:19].replace('T', ' ')}  ·  acc {report.holdout_accuracy:.3f}"
+    base = f"{report.timestamp[:19].replace('T', ' ')}  ·  acc {report.holdout_accuracy:.3f}"
+    if report.critique is None:
+        return base
+    if report.critique["verdict"] == "accept":
+        return f"{base}  ·  accepted"
+    return f"{base}  ·  rejected - {report.critique['defect_category']}"
 
 
 def _run_and_display(run_fn: Callable[[], RunReport], spinner_text: str) -> None:
@@ -231,8 +236,9 @@ def _render_loop_result(loop_result: LoopResult) -> None:
             st.metric("Winning round", loop_result.winner.round_index, border=True)
             st.metric("Rounds run", len(loop_result.attempts), border=True)
     else:
+        rounds_word = f"round{'s' if loop_result.rounds_attempted != 1 else ''}"
         st.warning(
-            f"No accepted baseline found in {len(loop_result.attempts)} rounds",
+            f"No accepted baseline found in {loop_result.rounds_attempted} {rounds_word}",
             icon=":material/gpp_maybe:",
         )
 
@@ -277,9 +283,19 @@ def _render_evaluation_tab() -> None:
         f"Last run: {summary['generated_at'][:19].replace('T', ' ')}  ·  model: {summary['model']}  ·  "
         f"{summary['trials_per_fixture']} critic trials per category"
     )
+    detection_rate = summary["overall_detection_rate"]
+    false_alarm_rate = summary["overall_false_alarm_rate"]
     with st.container(horizontal=True):
-        st.metric("Detection rate", f"{summary['overall_detection_rate']:.0%}", border=True)
-        st.metric("False-alarm rate", f"{summary['overall_false_alarm_rate']:.0%}", border=True)
+        st.metric(
+            "Detection rate",
+            f"{detection_rate:.0%}" if detection_rate is not None else "n/a",
+            border=True,
+        )
+        st.metric(
+            "False-alarm rate",
+            f"{false_alarm_rate:.0%}" if false_alarm_rate is not None else "n/a",
+            border=True,
+        )
         st.metric("Prompt tokens", summary["total_prompt_tokens"], border=True)
         st.metric("Completion tokens", summary["total_completion_tokens"], border=True)
 
@@ -287,7 +303,7 @@ def _render_evaluation_tab() -> None:
         {
             "category": row["defect_category"],
             "ground truth": row["ground_truth_verdict"],
-            "static check fired": "yes" if row["static_findings"] else "no",
+            "static check fired": "yes" if row.get("static_evidence_categories") else "no",
             "LLM-only reject rate": row["llm_only_reject_rate"],
             "combined reject rate": row["combined_reject_rate"],
             "holdout accuracy": row["holdout_accuracy"],
@@ -431,10 +447,24 @@ with st.sidebar:
     # only ever show up under the "All datasets" default, never as their own
     # filter option.
     all_runs = list_runs()
-    dataset_labels = {"": "All datasets"}
+    resolved_names: dict[str, str] = {}
     for r in all_runs:
         if r.dataset_id:
-            dataset_labels.setdefault(r.dataset_id, r.dataset_name or r.dataset_id)
+            resolved_names.setdefault(r.dataset_id, r.dataset_name or r.dataset_id)
+
+    # Two distinct dataset_ids can resolve to the same displayed name -
+    # disambiguate only the colliding ones with a short id suffix, so the
+    # common (no-collision) case stays unlabelled noise-free.
+    name_counts: dict[str, int] = {}
+    for name in resolved_names.values():
+        name_counts[name] = name_counts.get(name, 0) + 1
+
+    dataset_labels = {"": "All datasets"}
+    for dataset_id, name in resolved_names.items():
+        if name_counts[name] > 1:
+            dataset_labels[dataset_id] = f"{name} ({dataset_id[:8]})"
+        else:
+            dataset_labels[dataset_id] = name
     selected_dataset_id = st.selectbox(
         "Dataset",
         options=list(dataset_labels.keys()),
@@ -460,10 +490,11 @@ with st.sidebar:
                 seen_loop_ids.add(r.loop_id)
                 attempts = sorted(loop_attempts_by_id[r.loop_id], key=lambda a: a.round_index)
                 winner = select_loop_winner(attempts)
+                round_word = f"round{'s' if len(attempts) != 1 else ''}"
                 label = (
-                    f"Loop · {len(attempts)} rounds · winner acc {winner.holdout_accuracy:.3f}"
+                    f"Loop · {len(attempts)} {round_word} · winner acc {winner.holdout_accuracy:.3f}"
                     if winner is not None
-                    else f"Loop · {len(attempts)} rounds · no accepted result"
+                    else f"Loop · {len(attempts)} {round_word} · no accepted result"
                 )
                 entries.append((f"loop:{r.loop_id}", label))
             else:
@@ -511,8 +542,17 @@ with tab_run:
     if selected_loop_id:
         loop_attempts = list_loop_attempts(selected_loop_id)
         if loop_attempts:
+            # rounds_attempted isn't persisted (only produced live by
+            # run_feature_loop_async) - a crashed round leaves no run record
+            # at all, so len(loop_attempts) is the best count recoverable
+            # from disk on reload.
             _render_loop_result(
-                LoopResult(loop_id=selected_loop_id, attempts=loop_attempts, winner=select_loop_winner(loop_attempts))
+                LoopResult(
+                    loop_id=selected_loop_id,
+                    attempts=loop_attempts,
+                    winner=select_loop_winner(loop_attempts),
+                    rounds_attempted=len(loop_attempts),
+                )
             )
         else:
             st.info("Selected loop has no saved attempts.", icon=":material/info:")

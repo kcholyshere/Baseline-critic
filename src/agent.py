@@ -43,7 +43,7 @@ from mcp import StdioServerParameters
 from sklearn.metrics import accuracy_score, classification_report
 
 from src import config, dataset
-from src.checks import evidence_categories, run_static_checks
+from src.checks import run_checks
 from src.critic import Critique, critique_run_async
 from src.profiling import format_profile_for_prompt, profile_dataframe
 from src.report import RunReport, save_run
@@ -357,17 +357,25 @@ async def _run_baseline_async(
     final_text = ""
     modeller_prompt_tokens = 0
     modeller_completion_tokens = 0
-    async for event in runner.run_async(user_id=USER_ID, session_id=session.id, new_message=content):
-        if event.usage_metadata is not None:
-            modeller_prompt_tokens += event.usage_metadata.prompt_token_count or 0
-            modeller_completion_tokens += event.usage_metadata.candidates_token_count or 0
-        if event.is_final_response() and event.content and event.content.parts:
-            final_text = "".join(part.text or "" for part in event.content.parts)
-
-    execution: ExecutionResult | None = capture.get("result")
     run_id = uuid.uuid4().hex[:12]
+    execution: ExecutionResult | None = None
 
     try:
+        # The sandbox call (run_training_code -> run_code) happens inside
+        # this loop, via ADK's own tool invoker - a TrainingBudgetExceeded
+        # (src/services/code_execution.py) or any other sandbox failure
+        # raises here, not after it. Wrapping the loop itself, not just the
+        # report-building step below, is what makes the except block's
+        # ADR-008 failure-record guarantee actually cover this case, instead
+        # of the exception escaping _run_baseline_async with no trace on disk.
+        async for event in runner.run_async(user_id=USER_ID, session_id=session.id, new_message=content):
+            if event.usage_metadata is not None:
+                modeller_prompt_tokens += event.usage_metadata.prompt_token_count or 0
+                modeller_completion_tokens += event.usage_metadata.candidates_token_count or 0
+            if event.is_final_response() and event.content and event.content.parts:
+                final_text = "".join(part.text or "" for part in event.content.parts)
+
+        execution = capture.get("result")
         if execution is None:
             raise RuntimeError("Agent finished without calling run_training_code.")
 
@@ -427,13 +435,10 @@ async def _run_baseline_async(
         raise
 
     if run_critic:
-        static_findings = run_static_checks(
+        static_findings = run_checks(
             report.generated_code, train_path, target_column, report.stdout, report.holdout_accuracy
         )
-        static_evidence = evidence_categories(
-            report.generated_code, train_path, target_column, report.stdout, report.holdout_accuracy
-        )
-        critique = await critique_run_async(report, profile_text, static_findings, model, static_evidence)
+        critique = await critique_run_async(report, profile_text, static_findings, model)
         report.critique = critique.to_dict()
 
     save_run(report)
@@ -455,13 +460,10 @@ async def rescore_run_async(
     """
     train_df = pd.read_csv(train_path)
     profile_text = format_profile_for_prompt(profile_dataframe(train_df, report.target_column))
-    static_findings = run_static_checks(
+    static_findings = run_checks(
         report.generated_code, train_path, report.target_column, report.stdout, report.holdout_accuracy
     )
-    static_evidence = evidence_categories(
-        report.generated_code, train_path, report.target_column, report.stdout, report.holdout_accuracy
-    )
-    return await critique_run_async(report, profile_text, static_findings, _resolve_model(model), static_evidence)
+    return await critique_run_async(report, profile_text, static_findings, _resolve_model(model))
 
 
 def _resolve_model(model: str | LiteLlm | None) -> str | LiteLlm:

@@ -38,6 +38,7 @@ from google.adk.runners import InMemoryRunner
 from google.genai import types as genai_types
 from pydantic import BaseModel
 
+from src.checks import StaticFinding
 from src.report import RunReport
 
 APP_NAME = "baseline_critic_review"
@@ -87,9 +88,9 @@ class _CriticVerdict(BaseModel):
     evidence: str
 
 
-def _build_critic_instruction(report: RunReport, profile_text: str, static_findings: list[str]) -> str:
+def _build_critic_instruction(report: RunReport, profile_text: str, static_findings: list[StaticFinding]) -> str:
     findings_block = (
-        "\n".join(f"- {finding}" for finding in static_findings)
+        "\n".join(f"- {finding.text}" for finding in static_findings)
         if static_findings
         else "(none - the deterministic checks found nothing)"
     )
@@ -238,25 +239,31 @@ async def _run_critic_round(instruction: str, model: str | LiteLlm) -> tuple[_Cr
     return _parse_verdict(final_text), prompt_tokens, completion_tokens
 
 
-def _fallback_verdict(static_findings: list[str], evidence_categories: set[str]) -> _CriticVerdict:
+def _fallback_verdict(static_findings: list[StaticFinding], evidence_categories: set[str]) -> _CriticVerdict:
     """Used when every round either fails to parse or is gated as an
     unevidenced reject - the critic must always return something, never
     silently skip review (ADR-008's principle: a code-enforced ceiling, not
     a request, with a defined result when that ceiling is hit).
 
     Gated on evidence_categories, not static_findings: static_findings also
-    holds confirmation-only text (e.g. "target column IS excluded") that is
-    not evidence of a defect, so checking it directly would let an
+    holds confirmation-only findings (e.g. "target column IS excluded") that
+    are not evidence of a defect, so checking it directly would let an
     unevidenced reject survive relabelled as a fallback - exactly the
     hallucination the gate in critique_run_async exists to stop (ADR-016).
-    The chosen category is real static evidence, never a hardcoded guess."""
+    The chosen category is real static evidence, never a hardcoded guess.
+
+    The reported evidence text is filtered to findings tagged with the
+    chosen category - on code that trips two categories at once (e.g.
+    missing seed and missing stratify), the fallback must not name one
+    category while its evidence text describes both."""
     if evidence_categories:
         category = sorted(evidence_categories)[0]
+        matching_evidence = "; ".join(f.text for f in static_findings if f.category == category)
         return _CriticVerdict(
             verdict="reject",
             defect_category=category,
             defect=f"LLM critic review did not produce a usable, evidence-backed verdict; falling back to the deterministic static check, which found evidence of {category}.",
-            evidence="; ".join(static_findings),
+            evidence=matching_evidence,
         )
     return _CriticVerdict(
         verdict="accept",
@@ -269,17 +276,18 @@ def _fallback_verdict(static_findings: list[str], evidence_categories: set[str])
 async def critique_run_async(
     report: RunReport,
     profile_text: str,
-    static_findings: list[str],
+    static_findings: list[StaticFinding],
     model: str | LiteLlm,
-    evidence_categories: set[str],
 ) -> Critique:
-    """evidence_categories is the set of defect_category values src/checks.py
-    actually found real evidence for on this run (checks.py's own
-    evidence_categories(), computed from the same static-check pass that
-    produced static_findings). A reject naming any other category - other
-    than the UNGATED_CATEGORIES exemptions - is unevidenced: treated like an
+    """static_findings is the single-pass result of src.checks.run_checks() -
+    both the display text and the evidence-gate categories are derived from
+    it here, rather than being computed twice by the caller. A reject
+    naming a category with no matching finding - other than the
+    UNGATED_CATEGORIES exemptions - is unevidenced: treated like an
     unparseable response and retried, closing the general hallucination
     class rather than trusting any reject the LLM states (ADR-016)."""
+    evidence_categories = {f.category for f in static_findings if f.category is not None}
+    finding_texts = [f.text for f in static_findings]
     instruction = _build_critic_instruction(report, profile_text, static_findings)
     verdict: _CriticVerdict | None = None
     rounds_used = 0
@@ -308,7 +316,7 @@ async def critique_run_async(
         defect_category=verdict.defect_category,
         defect=verdict.defect,
         evidence=verdict.evidence,
-        static_findings=static_findings,
+        static_findings=finding_texts,
         rounds_used=rounds_used,
         fallback_used=fallback_used,
         gated_rejects=gated_rejects,

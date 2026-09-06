@@ -15,12 +15,17 @@ differs, so no code-level check can ever distinguish them (ADR-010).
 
 Each flagging check (not the confirmation-only ones) is tagged with the
 defect_category it is evidence for. src/critic.py's reject-gate (ADR-016)
-uses evidence_categories() to refuse an LLM reject verdict that names a
-category none of these checks actually found - closing the general
+reads each StaticFinding's category to refuse an LLM reject verdict that
+names a category none of these checks actually found - closing the general
 hallucination class (a reject with no static backing at all) rather than
 patching one hallucinated pattern at a time. temporal_leakage is
 deliberately untagged by any check (ADR-014's threshold search failed) and
 stays exempt from that gate, not silently caught by it.
+
+Callers get the findings from one call to run_checks() and derive display
+text and evidence categories from that same list themselves, rather than
+calling two separate functions that would each independently re-run every
+check (including the correlation check's CSV read).
 """
 
 import re
@@ -288,30 +293,16 @@ def _run_all_checks(
     return [finding for finding in checks if finding is not None]
 
 
-def run_static_checks(
+def run_checks(
     generated_code: str,
     train_path: Path,
     target_column: str,
     stdout: str,
     holdout_accuracy: float,
-) -> list[str]:
-    """Runs every static check and returns the findings that actually fired,
-    as display text - unchanged signature/behaviour for every existing
-    caller (src/agent.py, src/evaluation.py, the Streamlit UI)."""
-    findings = _run_all_checks(generated_code, train_path, target_column, stdout, holdout_accuracy)
-    return [finding.text for finding in findings]
-
-
-def evidence_categories(
-    generated_code: str,
-    train_path: Path,
-    target_column: str,
-    stdout: str,
-    holdout_accuracy: float,
-) -> set[str]:
-    """The defect_category values a static check actually found real
-    evidence for on this run - what src/critic.py's reject-gate (ADR-016)
-    checks an LLM reject verdict against. Confirmation-only findings and
-    checks with no matching DefectCategory never appear here."""
-    findings = _run_all_checks(generated_code, train_path, target_column, stdout, holdout_accuracy)
-    return {finding.category for finding in findings if finding.category is not None}
+) -> list[StaticFinding]:
+    """Runs every static check once and returns the raw findings. Callers
+    that need display text, evidence categories, or both (src/critic.py's
+    reject-gate, src/agent.py, src/evaluation.py) should derive them from
+    this one list rather than calling separate functions that would each
+    re-run every check independently."""
+    return _run_all_checks(generated_code, train_path, target_column, stdout, holdout_accuracy)

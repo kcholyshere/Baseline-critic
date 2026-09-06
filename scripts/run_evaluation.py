@@ -15,9 +15,18 @@ import argparse
 from src.evaluation import DEFAULT_TRIALS_PER_FIXTURE, run_evaluation
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"--trials must be a positive integer, got {value!r}")
+    return parsed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--trials", type=int, default=DEFAULT_TRIALS_PER_FIXTURE, help="Critic trials per fixture.")
+    parser.add_argument(
+        "--trials", type=_positive_int, default=DEFAULT_TRIALS_PER_FIXTURE, help="Critic trials per fixture."
+    )
     parser.add_argument(
         "--rebuild", action="store_true", help="Re-run every fixture's sandbox script instead of using the cache."
     )
@@ -25,22 +34,37 @@ def main() -> None:
 
     summary = run_evaluation(trials_per_fixture=args.trials, rebuild=args.rebuild)
 
+    detection_rate = (
+        f"{summary['overall_detection_rate']:.2f}" if summary["overall_detection_rate"] is not None else "n/a"
+    )
+    false_alarm_rate = (
+        f"{summary['overall_false_alarm_rate']:.2f}" if summary["overall_false_alarm_rate"] is not None else "n/a"
+    )
     print(f"\nModel: {summary['model']}")
-    print(f"Overall detection rate: {summary['overall_detection_rate']:.2f}")
-    print(f"Overall false-alarm rate: {summary['overall_false_alarm_rate']:.2f}")
+    print(f"Overall detection rate: {detection_rate}")
+    print(f"Overall false-alarm rate: {false_alarm_rate}")
     print(f"Tokens: {summary['total_prompt_tokens']} prompt, {summary['total_completion_tokens']} completion\n")
 
-    header = f"{'category':<28}{'truth':<8}{'static':<8}{'llm-only':<10}{'combined':<10}{'accuracy':<10}{'gated':<7}"
+    header = (
+        f"{'category':<28}{'truth':<8}{'static':<8}{'llm-only':<10}{'combined':<10}"
+        f"{'accuracy':<10}{'gated':<7}{'fallback':<9}"
+    )
     print(header)
     print("-" * len(header))
     for row in summary["categories"]:
-        static_hit = "yes" if row["static_findings"] else "no"
+        static_hit = "yes" if row["static_evidence_categories"] else "no"
         llm_only = f"{row['llm_only_reject_rate']:.2f}" if row["llm_only_reject_rate"] is not None else "n/a"
+        combined = f"{row['combined_reject_rate']:.2f}" if row["combined_reject_rate"] is not None else "n/a"
         print(
             f"{row['defect_category']:<28}{row['ground_truth_verdict']:<8}{static_hit:<8}"
-            f"{llm_only:<10}{row['combined_reject_rate']:<10.2f}{row['holdout_accuracy']:<10.4f}"
-            f"{row['gated_reject_count']:<7}"
+            f"{llm_only:<10}{combined:<10}{row['holdout_accuracy']:<10.4f}"
+            f"{row['gated_reject_count']:<7}{row['fallback_count']:<9}"
         )
+
+    if summary["failed_fixtures"]:
+        print("\nFixtures excluded from the numbers above (sandbox build failed):")
+        for failure in summary["failed_fixtures"]:
+            print(f"  {failure['defect_category']}: {failure['error']}")
 
 
 if __name__ == "__main__":

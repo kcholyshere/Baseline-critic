@@ -34,6 +34,12 @@ class LoopResult:
     loop_id: str
     attempts: list[RunReport]
     winner: RunReport | None
+    # Counted once per loop iteration regardless of outcome, unlike
+    # len(attempts) - a round that raises (MAX_TRAINING_ATTEMPTS exhausted,
+    # sandbox budget exhaustion) never joins `attempts` but still ran, and
+    # the UI's "no accepted baseline" message needs the true round count
+    # (audit-2026-09-06-post-loop.md finding #6).
+    rounds_attempted: int = 0
 
 
 def select_loop_winner(attempts: list[RunReport]) -> RunReport | None:
@@ -62,8 +68,10 @@ async def run_feature_loop_async(
     attempts: list[RunReport] = []
     last_successful: RunReport | None = None
     prior_summaries: list[str] = []
+    rounds_attempted = 0
 
     for round_index in range(1, max_rounds + 1):
+        rounds_attempted += 1
         revision_context: RevisionContext | None = None
         if last_successful is not None:
             critique = last_successful.critique
@@ -102,10 +110,20 @@ async def run_feature_loop_async(
 
         attempts.append(report)
         last_successful = report
-        prior_summaries.append(report.agent_summary)
+        # agent_summary is written before critique runs, so it's
+        # verdict-neutral by construction - tag it here so a rejected
+        # round doesn't read identically to an accepted one once it lands
+        # in a later round's "Prior attempts so far" prompt text (audit
+        # finding #7).
+        critique = report.critique
+        if critique["verdict"] == "accept":
+            tag = f"[accepted, acc={report.holdout_accuracy:.4f}]"
+        else:
+            tag = f"[rejected: {critique['defect_category']}]"
+        prior_summaries.append(f"{tag} {report.agent_summary}")
 
     winner = select_loop_winner(attempts)
-    return LoopResult(loop_id=loop_id, attempts=attempts, winner=winner)
+    return LoopResult(loop_id=loop_id, attempts=attempts, winner=winner, rounds_attempted=rounds_attempted)
 
 
 def run_feature_loop(model: str | LiteLlm | None = None, max_rounds: int = MAX_REVISION_ROUNDS) -> LoopResult:
