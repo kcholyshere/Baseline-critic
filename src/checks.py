@@ -77,6 +77,24 @@ def _check_missing_stratify(code: str) -> StaticFinding | None:
     return None
 
 
+def _check_missing_imbalance_correction(code: str, is_imbalanced: bool) -> StaticFinding | None:
+    """Flags code that ignores a target imbalance the profile already told it
+    about (src/profiling.py's IMBALANCE_THRESHOLD). category=None: like
+    _check_target_column_referenced, this is a real flag with no matching
+    DefectCategory in src/critic.py, so it stays informational context for
+    the critic rather than a gated reject reason (Krzysztof scoped this to
+    flag-plus-check only, not a new critic-gated category)."""
+    if not is_imbalanced:
+        return None
+    if any(marker in code for marker in ("class_weight", "scale_pos_weight", "is_unbalance")):
+        return None
+    return StaticFinding(
+        "The dataset profile flagged the target as imbalanced, but the script sets none of "
+        "class_weight, scale_pos_weight, or is_unbalance - it appears to train on the raw class "
+        "counts without correcting for the imbalance."
+    )
+
+
 def _check_missing_seed(code: str) -> StaticFinding | None:
     trains_with_lightgbm = re.search(r"\b(?:lgb|lightgbm)\.train\(", code)
     if trains_with_lightgbm and "seed" not in code and "random_state" not in code:
@@ -273,6 +291,7 @@ def _run_all_checks(
     target_column: str,
     stdout: str,
     holdout_accuracy: float,
+    is_imbalanced: bool,
 ) -> list[StaticFinding]:
     """Runs every static check once and returns the findings that fired -
     shared by run_static_checks (display text) and evidence_categories
@@ -282,6 +301,7 @@ def _run_all_checks(
         _check_column_order_instability(generated_code),
         _check_missing_stratify(generated_code),
         _check_missing_seed(generated_code),
+        _check_missing_imbalance_correction(generated_code, is_imbalanced),
         _check_foreign_file_path(generated_code, train_path),
         _check_public_dataset_import(generated_code),
         _check_target_column_referenced(generated_code, target_column),
@@ -299,10 +319,11 @@ def run_checks(
     target_column: str,
     stdout: str,
     holdout_accuracy: float,
+    is_imbalanced: bool = False,
 ) -> list[StaticFinding]:
     """Runs every static check once and returns the raw findings. Callers
     that need display text, evidence categories, or both (src/critic.py's
     reject-gate, src/agent.py, src/evaluation.py) should derive them from
     this one list rather than calling separate functions that would each
     re-run every check independently."""
-    return _run_all_checks(generated_code, train_path, target_column, stdout, holdout_accuracy)
+    return _run_all_checks(generated_code, train_path, target_column, stdout, holdout_accuracy, is_imbalanced)

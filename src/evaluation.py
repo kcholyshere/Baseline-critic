@@ -415,10 +415,16 @@ async def _run_fixture_trials(
 ) -> FixtureOutcome:
     train_df, _ = get_fixture_train_holdout(spec)
     train_path = fixture_train_path(spec.category)
+    profile = profile_dataframe(train_df, dataset.TARGET_COLUMN)
     static_findings = run_checks(
-        report.generated_code, train_path, dataset.TARGET_COLUMN, report.stdout, report.holdout_accuracy
+        report.generated_code,
+        train_path,
+        dataset.TARGET_COLUMN,
+        report.stdout,
+        report.holdout_accuracy,
+        profile["target"]["is_imbalanced"],
     )
-    profile_text = format_profile_for_prompt(profile_dataframe(train_df, dataset.TARGET_COLUMN))
+    profile_text = format_profile_for_prompt(profile)
 
     trials = [
         await critique_run_async(report, profile_text, static_findings, model)

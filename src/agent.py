@@ -436,7 +436,12 @@ async def _run_baseline_async(
 
     if run_critic:
         static_findings = run_checks(
-            report.generated_code, train_path, target_column, report.stdout, report.holdout_accuracy
+            report.generated_code,
+            train_path,
+            target_column,
+            report.stdout,
+            report.holdout_accuracy,
+            profile["target"]["is_imbalanced"],
         )
         critique = await critique_run_async(report, profile_text, static_findings, model)
         report.critique = critique.to_dict()
@@ -459,9 +464,15 @@ async def rescore_run_async(
     never overwritten, so past and re-scored verdicts stay comparable.
     """
     train_df = pd.read_csv(train_path)
-    profile_text = format_profile_for_prompt(profile_dataframe(train_df, report.target_column))
+    profile = profile_dataframe(train_df, report.target_column)
+    profile_text = format_profile_for_prompt(profile)
     static_findings = run_checks(
-        report.generated_code, train_path, report.target_column, report.stdout, report.holdout_accuracy
+        report.generated_code,
+        train_path,
+        report.target_column,
+        report.stdout,
+        report.holdout_accuracy,
+        profile["target"]["is_imbalanced"],
     )
     return await critique_run_async(report, profile_text, static_findings, _resolve_model(model))
 
