@@ -63,6 +63,37 @@ def _check_target_column_referenced(code: str, target_column: str) -> str | None
     return None
 
 
+def _check_target_excluded_from_features(code: str, target_column: str) -> str | None:
+    """Unlike every other check here, this only ever confirms, never flags -
+    ADR-010's and ADR-012's live evaluation runs both reproduced the critic
+    rejecting a clean script by claiming the target column wasn't excluded
+    from the feature set when it plainly was (e.g. `X =
+    df.drop(columns=['diagnosis'])`, still present as features in the same
+    dataframe used to train). When the code matches one of the real
+    exclusion patterns actually observed in generated code and fixtures
+    (drop(columns=...), a "not in [...]" filter list building a feature
+    list, .columns.difference(...)), state that explicitly as a fact for the
+    critic to trust over its own reading. When none of these match, stay
+    silent rather than raise a new suspicion - the model may have excluded
+    the target some other valid way this check doesn't recognise, and a
+    static check should not manufacture a false lead."""
+    escaped = re.escape(target_column)
+    patterns = [
+        rf"drop\(\s*columns\s*=\s*\[[^\]]*{escaped}[^\]]*\]",
+        rf"drop\(\s*\[[^\]]*{escaped}[^\]]*\]\s*,\s*axis\s*=\s*1",
+        rf"not\s+in\s*\[[^\]]*{escaped}[^\]]*\]",
+        rf"columns\.difference\(\s*\[[^\]]*{escaped}[^\]]*\]",
+    ]
+    if any(re.search(pattern, code) for pattern in patterns):
+        return (
+            f"Target column '{target_column}' IS excluded from the feature set "
+            "(matched a recognised exclusion pattern in the code) - do not reject "
+            "on a claim that it is present in the features without re-reading the "
+            "code yourself first."
+        )
+    return None
+
+
 def _check_val_holdout_gap(stdout: str, holdout_accuracy: float) -> str | None:
     accuracy_lines = [line for line in stdout.splitlines() if "accuracy" in line.lower()]
     if not accuracy_lines:
@@ -100,6 +131,7 @@ def run_static_checks(
         _check_foreign_file_path(generated_code, train_path),
         _check_public_dataset_import(generated_code),
         _check_target_column_referenced(generated_code, target_column),
+        _check_target_excluded_from_features(generated_code, target_column),
         _check_val_holdout_gap(stdout, holdout_accuracy),
     ]
     return [finding for finding in checks if finding is not None]
