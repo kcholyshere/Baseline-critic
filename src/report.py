@@ -68,6 +68,10 @@ class RunReport:
     modeller_completion_tokens: int = 0
     failed: bool = False
     failure_reason: str = ""
+    dataset_id: str = ""
+    loop_id: str | None = None
+    round_index: int = 0
+    revised_from_run_id: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -97,10 +101,11 @@ def load_latest_run() -> RunReport | None:
     return None
 
 
-def list_runs() -> list[RunReport]:
+def list_runs(dataset_id: str | None = None) -> list[RunReport]:
     """Returns all saved run records, most recent first. A file that fails to
     parse (e.g. left truncated by an interrupted write) is skipped rather
-    than raised, so one corrupted run can't take down the whole list."""
+    than raised, so one corrupted run can't take down the whole list.
+    Pass dataset_id to restrict to runs trained against that dataset."""
     if not RUNS_DIR.exists():
         return []
     run_files = sorted(RUNS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -113,7 +118,18 @@ def list_runs() -> list[RunReport]:
             runs.append(RunReport(**data))
         except TypeError:
             continue
+    if dataset_id is not None:
+        runs = [r for r in runs if r.dataset_id == dataset_id]
     return runs
+
+
+def list_loop_attempts(loop_id: str) -> list[RunReport]:
+    """Returns every saved run belonging to one feature-proposal-loop
+    invocation, ordered by round_index rather than recency - callers need
+    the attempt sequence a loop took, not when each attempt happened to
+    be written to disk."""
+    runs = [r for r in list_runs() if r.loop_id == loop_id]
+    return sorted(runs, key=lambda r: r.round_index)
 
 
 def save_rescoring(run_id: str, critique: dict, model: str) -> Path:

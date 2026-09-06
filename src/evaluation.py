@@ -47,7 +47,7 @@ from google.adk.models.lite_llm import LiteLlm
 
 from src import config, dataset
 from src.agent import build_run_report_from_execution
-from src.checks import run_static_checks
+from src.checks import evidence_categories, run_static_checks
 from src.critic import Critique, critique_run_async
 from src.profiling import format_profile_for_prompt, profile_dataframe
 from src.report import RunReport, _atomic_write_json, _read_json_or_none
@@ -387,6 +387,14 @@ class FixtureOutcome:
     def fallback_count(self) -> int:
         return sum(1 for t in self.trials if t.fallback_used)
 
+    @property
+    def gated_reject_count(self) -> int:
+        """How many rounds, across all trials, the reject-gate (ADR-016)
+        discarded an unevidenced reject and forced a retry - distinct from
+        fallback_count, which also counts rounds that failed to parse for
+        unrelated reasons (bad JSON, self-inconsistent verdict)."""
+        return sum(t.gated_rejects for t in self.trials)
+
 
 async def _run_fixture_trials(
     report: RunReport, spec: FixtureSpec, trials_per_fixture: int, model: str | LiteLlm
@@ -396,10 +404,14 @@ async def _run_fixture_trials(
     static_findings = run_static_checks(
         report.generated_code, train_path, dataset.TARGET_COLUMN, report.stdout, report.holdout_accuracy
     )
+    static_evidence = evidence_categories(
+        report.generated_code, train_path, dataset.TARGET_COLUMN, report.stdout, report.holdout_accuracy
+    )
     profile_text = format_profile_for_prompt(profile_dataframe(train_df, dataset.TARGET_COLUMN))
 
     trials = [
-        await critique_run_async(report, profile_text, static_findings, model) for _ in range(trials_per_fixture)
+        await critique_run_async(report, profile_text, static_findings, model, static_evidence)
+        for _ in range(trials_per_fixture)
     ]
     return FixtureOutcome(
         category=spec.category,
@@ -431,6 +443,7 @@ def _build_summary(outcomes: list[FixtureOutcome], trials_per_fixture: int, mode
                 "combined_reject_rate": outcome.combined_reject_rate,
                 "llm_only_reject_rate": outcome.llm_only_reject_rate,
                 "fallback_count": outcome.fallback_count,
+                "gated_reject_count": outcome.gated_reject_count,
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 # What the critic actually said on each rejecting trial - without

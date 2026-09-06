@@ -14,7 +14,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 TIMEOUT_SECONDS = 120
-MAX_CALLS_PER_SESSION = 20
+# A module-level global, not a per-Streamlit-browser-session counter - it
+# never resets, so it bounds this whole process's lifetime, not one UI
+# session. One feature-proposal-loop invocation (src/feature_loop.py) can
+# itself cost up to MAX_REVISION_ROUNDS x MAX_TRAINING_ATTEMPTS = 3 x 3 = 9
+# sandbox calls, so the old ceiling of 20 let the process survive barely two
+# loop invocations before erroring - unusable as a demo. 60 gives headroom
+# for several loop invocations plus standalone single-shot runs within one
+# process lifetime.
+MAX_CALLS_PER_SESSION = 60
 MAX_ARTIFACT_BYTES = 50 * 1024 * 1024  # 50 MB per artifact file
 
 _call_count = 0
@@ -22,7 +30,7 @@ _call_count_lock = threading.Lock()
 
 
 class TrainingBudgetExceeded(Exception):
-    """Raised once a session exceeds MAX_CALLS_PER_SESSION code-execution calls."""
+    """Raised once this process exceeds MAX_CALLS_PER_SESSION code-execution calls."""
 
 
 @dataclass
@@ -47,7 +55,7 @@ def run_code(code: str) -> ExecutionResult:
     with _call_count_lock:
         if _call_count >= MAX_CALLS_PER_SESSION:
             raise TrainingBudgetExceeded(
-                f"Training budget of {MAX_CALLS_PER_SESSION} calls exhausted this session."
+                f"Training budget of {MAX_CALLS_PER_SESSION} calls exhausted for this process."
             )
         _call_count += 1
 

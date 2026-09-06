@@ -29,3 +29,4 @@ Live task list: agent_docs/TODOS.md. Full decision log with rationale: agent_doc
 - Commit and push at reasonable intervals
 - Final project due Monday 2026-09-07. Deliver as much as possible, but keep it explainable - don't outrun what can be walked through without a big comprehension debt.
 - Keep agent_docs/TODOS.md current automatically, without being asked: check off an item the moment it's done, add new ones as they come up. It is not a documentation file - one line per item, plain checkboxes under the phase headings, no extra formatting or explanation.
+- Fire the resumify skill automatically the moment a genuinely high-impact result lands (a measurable before/after, a non-obvious debugging insight, a real architectural trade-off) - do not wait to be asked. This rule exists because it was missed repeatedly before 2026-09-06.

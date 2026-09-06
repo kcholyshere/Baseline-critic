@@ -30,7 +30,7 @@ def main() -> None:
     print(f"Overall false-alarm rate: {summary['overall_false_alarm_rate']:.2f}")
     print(f"Tokens: {summary['total_prompt_tokens']} prompt, {summary['total_completion_tokens']} completion\n")
 
-    header = f"{'category':<28}{'truth':<8}{'static':<8}{'llm-only':<10}{'combined':<10}{'accuracy':<10}"
+    header = f"{'category':<28}{'truth':<8}{'static':<8}{'llm-only':<10}{'combined':<10}{'accuracy':<10}{'gated':<7}"
     print(header)
     print("-" * len(header))
     for row in summary["categories"]:
@@ -39,6 +39,7 @@ def main() -> None:
         print(
             f"{row['defect_category']:<28}{row['ground_truth_verdict']:<8}{static_hit:<8}"
             f"{llm_only:<10}{row['combined_reject_rate']:<10.2f}{row['holdout_accuracy']:<10.4f}"
+            f"{row['gated_reject_count']:<7}"
         )
 
 

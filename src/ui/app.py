@@ -18,8 +18,15 @@ import streamlit as st
 
 from src import config, dataset, evaluation
 from src.agent import rescore_run_async, run_baseline, run_baseline_for
+from src.feature_loop import (
+    MAX_REVISION_ROUNDS,
+    LoopResult,
+    run_feature_loop,
+    run_feature_loop_for,
+    select_loop_winner,
+)
 from src.profiling import profile_dataframe
-from src.report import RunReport, list_rescorings, list_runs, save_rescoring
+from src.report import RunReport, list_loop_attempts, list_rescorings, list_runs, save_rescoring
 
 st.set_page_config(
     page_title="Baseline critic",
@@ -46,7 +53,8 @@ st.html("""
     margin: 0;
     font-size: 0.95rem;
 }
-.st-key-run_button button, .st-key-run_button_upload button {
+.st-key-run_button button, .st-key-run_button_upload button,
+.st-key-run_loop_button button, .st-key-run_loop_button_upload button {
     width: 100%;
     font-weight: 600;
 }
@@ -85,15 +93,35 @@ def _run_and_display(run_fn: Callable[[], RunReport], spinner_text: str) -> None
     """Shared scaffolding for both "Run baseline" buttons: spinner, call,
     stash the new run as selected, toast, rerun - or surface the error the
     same way if the run fails. Kept in one place so the demo-dataset and
-    upload-CSV handlers can't drift into slightly different behaviour."""
+    upload-CSV handlers can't drift into slightly different behaviour.
+
+    Clears selected_loop_id so a freshly picked single run always wins over
+    whatever loop was previously selected - the two selection states must
+    never both point at something "live" at once."""
     try:
         with st.spinner(spinner_text, show_time=True):
             new_report = run_fn()
         st.session_state["selected_run_id"] = new_report.run_id
+        st.session_state["selected_loop_id"] = None
         st.toast("Run complete", icon=":material/check_circle:")
         st.rerun()
     except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
         st.error(f"Run failed: {exc}", icon=":material/error:")
+
+
+def _run_loop_and_display(run_fn: Callable[[], LoopResult], spinner_text: str) -> None:
+    """Loop-shaped counterpart to _run_and_display - same scaffold, but for a
+    function returning LoopResult, and clearing selected_run_id the same way
+    the single-run path clears selected_loop_id."""
+    try:
+        with st.spinner(spinner_text, show_time=True):
+            loop_result = run_fn()
+        st.session_state["selected_loop_id"] = loop_result.loop_id
+        st.session_state["selected_run_id"] = None
+        st.toast("Feature loop complete", icon=":material/check_circle:")
+        st.rerun()
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+        st.error(f"Feature loop failed: {exc}", icon=":material/error:")
 
 
 def _render_report(report: RunReport) -> None:
@@ -193,6 +221,33 @@ def _render_report(report: RunReport) -> None:
 
     with st.expander("Sandbox stdout", icon=":material/terminal:"):
         st.code(report.stdout or "(no output)", language="text")
+
+
+def _render_loop_result(loop_result: LoopResult) -> None:
+    if loop_result.winner is not None:
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.badge("Winner found", icon=":material/emoji_events:", color="green")
+            st.metric("Winner holdout accuracy", f"{loop_result.winner.holdout_accuracy:.1%}", border=True)
+            st.metric("Winning round", loop_result.winner.round_index, border=True)
+            st.metric("Rounds run", len(loop_result.attempts), border=True)
+    else:
+        st.warning(
+            f"No accepted baseline found in {len(loop_result.attempts)} rounds",
+            icon=":material/gpp_maybe:",
+        )
+
+    # Tabs, not expanders - _render_report nests its own expanders, and
+    # Streamlit doesn't allow an expander inside an expander.
+    round_tabs = st.tabs(
+        [
+            f"Round {attempt.round_index} - "
+            + ("accepted" if attempt.critique is not None and attempt.critique["verdict"] == "accept" else "rejected")
+            for attempt in loop_result.attempts
+        ]
+    )
+    for tab, attempt in zip(round_tabs, loop_result.attempts):
+        with tab:
+            _render_report(attempt)
 
 
 def _render_evaluation_tab() -> None:
@@ -295,10 +350,22 @@ with st.sidebar:
         label_visibility="collapsed",
     )
 
+    max_rounds = st.slider(
+        "Feature loop rounds",
+        min_value=1,
+        max_value=MAX_REVISION_ROUNDS,
+        value=MAX_REVISION_ROUNDS,
+        key="feature_loop_rounds",
+        help="Each round is a real LLM call (roughly 1-3 minutes) - lower this for a quicker check.",
+    )
+    loop_spinner_text = f"Agent is running the feature-proposal loop ({max_rounds} round{'s' if max_rounds != 1 else ''})..."
+
     if mode == "Demo dataset":
         st.caption("Breast Cancer Wisconsin, target: diagnosis")
         if st.button("Run baseline", icon=":material/play_arrow:", type="primary", key="run_button"):
             _run_and_display(run_baseline, "Agent is writing and training a baseline...")
+        if st.button("Run feature loop", icon=":material/loop:", key="run_loop_button"):
+            _run_loop_and_display(lambda: run_feature_loop(max_rounds=max_rounds), loop_spinner_text)
 
     else:
         st.caption("Binary classification only for this version.")
@@ -339,21 +406,93 @@ with st.sidebar:
 
                     _run_and_display(_run_uploaded, "Agent is writing and training a baseline...")
 
+                if st.button("Run feature loop", icon=":material/loop:", key="run_loop_button_upload"):
+
+                    def _run_uploaded_loop() -> LoopResult:
+                        uploaded = dataset.prepare_uploaded_dataset(upload_df, upload_target_column, upload_file_name)
+                        return run_feature_loop_for(
+                            train_path=uploaded.train_path,
+                            target_column=upload_target_column,
+                            positive_class=upload_positive_class,
+                            negative_class=upload_negative_class,
+                            holdout=uploaded.holdout,
+                            dataset_name=uploaded.dataset_name,
+                            max_rounds=max_rounds,
+                        )
+
+                    _run_loop_and_display(_run_uploaded_loop, loop_spinner_text)
+
     st.divider()
     st.subheader("Runs")
-    runs = list_runs()
+
+    # dataset_id (a content hash, src/agent.py) is the real grouping key -
+    # dataset_name is just the human label, and two dataset_ids could in
+    # principle share one name. Pre-existing runs have dataset_id == "" and
+    # only ever show up under the "All datasets" default, never as their own
+    # filter option.
+    all_runs = list_runs()
+    dataset_labels = {"": "All datasets"}
+    for r in all_runs:
+        if r.dataset_id:
+            dataset_labels.setdefault(r.dataset_id, r.dataset_name or r.dataset_id)
+    selected_dataset_id = st.selectbox(
+        "Dataset",
+        options=list(dataset_labels.keys()),
+        format_func=lambda ds_id: dataset_labels[ds_id],
+        key="runs_dataset_filter",
+    )
+
+    runs = list_runs(dataset_id=selected_dataset_id or None)
     if runs:
-        labels = {r.run_id: _run_label(r) for r in runs}
-        default_id = st.session_state.get("selected_run_id", runs[0].run_id)
-        default_index = next((i for i, r in enumerate(runs) if r.run_id == default_id), 0)
-        selected_id = st.selectbox(
+        # Sibling rounds of one loop collapse into a single selectable entry
+        # rather than appearing as separate flat rows.
+        loop_attempts_by_id: dict[str, list[RunReport]] = {}
+        for r in runs:
+            if r.loop_id:
+                loop_attempts_by_id.setdefault(r.loop_id, []).append(r)
+
+        entries: list[tuple[str, str]] = []
+        seen_loop_ids: set[str] = set()
+        for r in runs:
+            if r.loop_id:
+                if r.loop_id in seen_loop_ids:
+                    continue
+                seen_loop_ids.add(r.loop_id)
+                attempts = sorted(loop_attempts_by_id[r.loop_id], key=lambda a: a.round_index)
+                winner = select_loop_winner(attempts)
+                label = (
+                    f"Loop · {len(attempts)} rounds · winner acc {winner.holdout_accuracy:.3f}"
+                    if winner is not None
+                    else f"Loop · {len(attempts)} rounds · no accepted result"
+                )
+                entries.append((f"loop:{r.loop_id}", label))
+            else:
+                entries.append((f"run:{r.run_id}", _run_label(r)))
+
+        entry_labels = dict(entries)
+        entry_ids = [entry_id for entry_id, _ in entries]
+
+        if st.session_state.get("selected_loop_id"):
+            default_entry_id = f"loop:{st.session_state['selected_loop_id']}"
+        elif st.session_state.get("selected_run_id"):
+            default_entry_id = f"run:{st.session_state['selected_run_id']}"
+        else:
+            default_entry_id = entry_ids[0]
+        default_index = entry_ids.index(default_entry_id) if default_entry_id in entry_ids else 0
+
+        selected_entry_id = st.selectbox(
             "Past runs",
-            options=[r.run_id for r in runs],
-            format_func=lambda run_id: labels[run_id],
+            options=entry_ids,
+            format_func=lambda entry_id: entry_labels[entry_id],
             index=default_index,
             label_visibility="collapsed",
         )
-        st.session_state["selected_run_id"] = selected_id
+        if selected_entry_id.startswith("loop:"):
+            st.session_state["selected_loop_id"] = selected_entry_id.removeprefix("loop:")
+            st.session_state["selected_run_id"] = None
+        else:
+            st.session_state["selected_run_id"] = selected_entry_id.removeprefix("run:")
+            st.session_state["selected_loop_id"] = None
 
 tab_run, tab_evaluation = st.tabs(["Run", "Evaluation harness"])
 
@@ -368,7 +507,16 @@ with tab_run:
             st.dataframe(_profile_df(upload_profile), width="stretch")
         st.divider()
 
-    if not runs:
+    selected_loop_id = st.session_state.get("selected_loop_id")
+    if selected_loop_id:
+        loop_attempts = list_loop_attempts(selected_loop_id)
+        if loop_attempts:
+            _render_loop_result(
+                LoopResult(loop_id=selected_loop_id, attempts=loop_attempts, winner=select_loop_winner(loop_attempts))
+            )
+        else:
+            st.info("Selected loop has no saved attempts.", icon=":material/info:")
+    elif not runs:
         st.info(
             "No runs yet. Click **Run baseline** in the sidebar to train the first one.",
             icon=":material/info:",

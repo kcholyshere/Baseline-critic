@@ -12,9 +12,19 @@ One check (_check_feature_target_correlation, ADR-014) reads the actual
 training data rather than the code text - the eval harness's target_leakage
 fixture uses code byte-identical to the clean fixture, only the CSV
 differs, so no code-level check can ever distinguish them (ADR-010).
+
+Each flagging check (not the confirmation-only ones) is tagged with the
+defect_category it is evidence for. src/critic.py's reject-gate (ADR-016)
+uses evidence_categories() to refuse an LLM reject verdict that names a
+category none of these checks actually found - closing the general
+hallucination class (a reject with no static backing at all) rather than
+patching one hallucinated pattern at a time. temporal_leakage is
+deliberately untagged by any check (ADR-014's threshold search failed) and
+stays exempt from that gate, not silently caught by it.
 """
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -32,46 +42,75 @@ _FILE_READ_PATTERN = re.compile(r"(?:read_csv|read_json|read_parquet)\(\s*['\"](
 _DECIMAL_PATTERN = re.compile(r"\d\.\d+")
 
 
-def _check_column_order_instability(code: str) -> str | None:
+@dataclass
+class StaticFinding:
+    """One static-check result. `category` is set only when the finding is
+    positive evidence that a specific named defect is real - confirmation-only
+    findings and checks with no matching DefectCategory (e.g.
+    _check_target_column_referenced) leave it None, so they can never satisfy
+    src/critic.py's reject-gate."""
+
+    text: str
+    category: str | None = None
+
+
+def _check_column_order_instability(code: str) -> StaticFinding | None:
     if ".columns.difference(" in code or re.search(r"\bsorted\(\s*(?:list\()?\s*\w*\.?columns", code):
-        return "Feature list may be built in a non-original column order (.columns.difference()/sorted() over columns) - LightGBM's Booster.predict() matches columns by position, not name, so this can silently misalign predictions without raising an error."
+        return StaticFinding(
+            "Feature list may be built in a non-original column order (.columns.difference()/sorted() over columns) - LightGBM's Booster.predict() matches columns by position, not name, so this can silently misalign predictions without raising an error.",
+            category="score_mismatch",
+        )
     return None
 
 
-def _check_missing_stratify(code: str) -> str | None:
+def _check_missing_stratify(code: str) -> StaticFinding | None:
     if "train_test_split(" in code and "stratify" not in code:
-        return "train_test_split() is used without stratify= - risks a degenerate internal validation split on an imbalanced target."
+        return StaticFinding(
+            "train_test_split() is used without stratify= - risks a degenerate internal validation split on an imbalanced target.",
+            category="degenerate_split",
+        )
     return None
 
 
-def _check_missing_seed(code: str) -> str | None:
+def _check_missing_seed(code: str) -> StaticFinding | None:
     trains_with_lightgbm = re.search(r"\b(?:lgb|lightgbm)\.train\(", code)
     if trains_with_lightgbm and "seed" not in code and "random_state" not in code:
-        return "lightgbm.train() is called with no seed/random_state anywhere in the script - unseeded randomness, named explicitly in the proposal as a defect to catch."
+        return StaticFinding(
+            "lightgbm.train() is called with no seed/random_state anywhere in the script - unseeded randomness, named explicitly in the proposal as a defect to catch.",
+            category="unseeded_randomness",
+        )
     return None
 
 
-def _check_foreign_file_path(code: str, train_path: Path) -> str | None:
+def _check_foreign_file_path(code: str, train_path: Path) -> StaticFinding | None:
     expected = str(train_path)
     for match in _FILE_READ_PATTERN.finditer(code):
         if match.group(1) != expected:
-            return f"Script reads a file path other than the given training CSV ({match.group(1)!r}) - possible train/test contamination."
+            return StaticFinding(
+                f"Script reads a file path other than the given training CSV ({match.group(1)!r}) - possible train/test contamination.",
+                category="train_test_contamination",
+            )
     return None
 
 
-def _check_public_dataset_import(code: str) -> str | None:
+def _check_public_dataset_import(code: str) -> StaticFinding | None:
     if _PUBLIC_DATASET_PATTERN.search(code):
-        return "Script imports a public dataset loader (e.g. sklearn.datasets) - this is the exact route by which a generated script could load the full source dataset, including the withheld holdout rows (ADR-005)."
+        return StaticFinding(
+            "Script imports a public dataset loader (e.g. sklearn.datasets) - this is the exact route by which a generated script could load the full source dataset, including the withheld holdout rows (ADR-005).",
+            category="train_test_contamination",
+        )
     return None
 
 
-def _check_target_column_referenced(code: str, target_column: str) -> str | None:
+def _check_target_column_referenced(code: str, target_column: str) -> StaticFinding | None:
     if target_column not in code:
-        return f"The target column name '{target_column}' never appears in the generated code - it may have hardcoded a different column name instead, which would be silently wrong on any dataset other than the one it was tested against."
+        return StaticFinding(
+            f"The target column name '{target_column}' never appears in the generated code - it may have hardcoded a different column name instead, which would be silently wrong on any dataset other than the one it was tested against."
+        )
     return None
 
 
-def _check_target_excluded_from_features(code: str, target_column: str) -> str | None:
+def _check_target_excluded_from_features(code: str, target_column: str) -> StaticFinding | None:
     """Unlike every other check here, this only ever confirms, never flags -
     ADR-010's and ADR-012's live evaluation runs both reproduced the critic
     rejecting a clean script by claiming the target column wasn't excluded
@@ -93,7 +132,7 @@ def _check_target_excluded_from_features(code: str, target_column: str) -> str |
         rf"columns\.difference\(\s*\[[^\]]*{escaped}[^\]]*\]",
     ]
     if any(re.search(pattern, code) for pattern in patterns):
-        return (
+        return StaticFinding(
             f"Target column '{target_column}' IS excluded from the feature set "
             "(matched a recognised exclusion pattern in the code) - do not reject "
             "on a claim that it is present in the features without re-reading the "
@@ -102,7 +141,7 @@ def _check_target_excluded_from_features(code: str, target_column: str) -> str |
     return None
 
 
-def _check_scored_on_training_rows(code: str) -> str | None:
+def _check_scored_on_training_rows(code: str) -> StaticFinding | None:
     """Flags a script whose final .predict() call scores the exact same
     feature variable it just built the training lgb.Dataset from, instead
     of the held-back validation split - a genuine claim-vs-reality mismatch
@@ -121,16 +160,17 @@ def _check_scored_on_training_rows(code: str) -> str | None:
     train_features_var = train_match.group(1)
     predict_calls = re.findall(r"\.predict\(\s*(\w+)\s*\)", code)
     if predict_calls and predict_calls[-1] == train_features_var:
-        return (
+        return StaticFinding(
             f"The script's final .predict() call scores '{train_features_var}' - the same "
             "features it just trained on - rather than a held-back validation split, so the "
             "reported accuracy measures fit to training data, not generalisation "
-            "(defect_category: score_mismatch)."
+            "(defect_category: score_mismatch).",
+            category="score_mismatch",
         )
     return None
 
 
-def _check_val_holdout_gap(stdout: str, holdout_accuracy: float, scored_on_training_rows: bool) -> str | None:
+def _check_val_holdout_gap(stdout: str, holdout_accuracy: float, scored_on_training_rows: bool) -> StaticFinding | None:
     """Two-sided, unlike the checks above it: a small gap is stated as a
     confirmed fact, not left silent, because the eval harness (Phase 5)
     found the critic treating any difference at all - even a ~0.002 gap
@@ -161,15 +201,16 @@ def _check_val_holdout_gap(stdout: str, holdout_accuracy: float, scored_on_train
     val_accuracy = float(decimals[-1])
     gap = abs(val_accuracy - holdout_accuracy)
     if gap > VAL_HOLDOUT_GAP_THRESHOLD:
-        return (
+        return StaticFinding(
             f"Internal validation accuracy ({val_accuracy:.4f}) and real holdout accuracy "
             f"({holdout_accuracy:.4f}) differ by {gap:.4f}, over the {VAL_HOLDOUT_GAP_THRESHOLD} "
             "threshold - the reported validation score may not be a reliable estimate of the "
-            "real result, in either direction."
+            "real result, in either direction.",
+            category="score_mismatch",
         )
     if scored_on_training_rows:
         return None
-    return (
+    return StaticFinding(
         f"Internal validation accuracy ({val_accuracy:.4f}) and real holdout accuracy "
         f"({holdout_accuracy:.4f}) differ by {gap:.4f} - within the normal range for two "
         "different samples of similar size. They are not the same measurement and are not "
@@ -177,7 +218,7 @@ def _check_val_holdout_gap(stdout: str, holdout_accuracy: float, scored_on_train
     )
 
 
-def _check_feature_target_correlation(train_path: Path, target_column: str) -> str | None:
+def _check_feature_target_correlation(train_path: Path, target_column: str) -> StaticFinding | None:
     """Flags a feature whose correlation with the (binarised) target exceeds
     LEAKAGE_CORRELATION_THRESHOLD - the classic "the answer got left in a
     feature" pattern. Threshold picked with a wide, measured safety margin:
@@ -212,22 +253,25 @@ def _check_feature_target_correlation(train_path: Path, target_column: str) -> s
     if offenders.empty:
         return None
     worst_feature = offenders.idxmax()
-    return (
+    return StaticFinding(
         f"Feature '{worst_feature}' correlates with the target at {offenders[worst_feature]:.4f} "
         f"(threshold {LEAKAGE_CORRELATION_THRESHOLD}) - near-perfect correlation with the label is "
         "the classic target-leakage signature (a copy of the answer left in the features), well "
-        "beyond what a legitimately predictive feature reaches on real data."
+        "beyond what a legitimately predictive feature reaches on real data.",
+        category="target_leakage",
     )
 
 
-def run_static_checks(
+def _run_all_checks(
     generated_code: str,
     train_path: Path,
     target_column: str,
     stdout: str,
     holdout_accuracy: float,
-) -> list[str]:
-    """Runs every static check and returns the findings that actually fired."""
+) -> list[StaticFinding]:
+    """Runs every static check once and returns the findings that fired -
+    shared by run_static_checks (display text) and evidence_categories
+    (src/critic.py's reject-gate) so both read off the same computation."""
     scored_on_training_rows_finding = _check_scored_on_training_rows(generated_code)
     checks = [
         _check_column_order_instability(generated_code),
@@ -242,3 +286,32 @@ def run_static_checks(
         _check_val_holdout_gap(stdout, holdout_accuracy, scored_on_training_rows_finding is not None),
     ]
     return [finding for finding in checks if finding is not None]
+
+
+def run_static_checks(
+    generated_code: str,
+    train_path: Path,
+    target_column: str,
+    stdout: str,
+    holdout_accuracy: float,
+) -> list[str]:
+    """Runs every static check and returns the findings that actually fired,
+    as display text - unchanged signature/behaviour for every existing
+    caller (src/agent.py, src/evaluation.py, the Streamlit UI)."""
+    findings = _run_all_checks(generated_code, train_path, target_column, stdout, holdout_accuracy)
+    return [finding.text for finding in findings]
+
+
+def evidence_categories(
+    generated_code: str,
+    train_path: Path,
+    target_column: str,
+    stdout: str,
+    holdout_accuracy: float,
+) -> set[str]:
+    """The defect_category values a static check actually found real
+    evidence for on this run - what src/critic.py's reject-gate (ADR-016)
+    checks an LLM reject verdict against. Confirmation-only findings and
+    checks with no matching DefectCategory never appear here."""
+    findings = _run_all_checks(generated_code, train_path, target_column, stdout, holdout_accuracy)
+    return {finding.category for finding in findings if finding.category is not None}

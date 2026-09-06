@@ -18,6 +18,14 @@ ADR-008 already drew from the modeller agent: MAX_CRITIQUE_ROUNDS caps how
 many times an unparseable response gets retried, and critique_run always
 returns a Critique, falling back to a verdict implied by the static
 findings alone rather than raising or hanging.
+
+The reject-gate (ADR-016) closes the general critic hallucination class
+identified during Phase 5 calibration (agent_docs/decisions.md ADR-013,
+ADR-015): a reject naming a defect_category that no static check actually
+found evidence for is treated the same as an unparseable response and
+retried, rather than trusted outright. temporal_leakage is exempt by
+design - ADR-014 found no safe static threshold for it, so it stays
+critic-only, not silently caught by a gate with nothing behind it.
 """
 
 import json
@@ -46,6 +54,12 @@ DefectCategory = Literal[
     "none",
 ]
 
+# temporal_leakage has no static check by design (ADR-014: no correlation
+# threshold safely separates it from a legitimately strong feature) - it
+# stays exempt from the reject-gate below rather than being blocked by a
+# check that was never built.
+UNGATED_CATEGORIES = {"temporal_leakage", "none"}
+
 
 @dataclass
 class Critique:
@@ -56,6 +70,7 @@ class Critique:
     static_findings: list[str]
     rounds_used: int
     fallback_used: bool = False
+    gated_rejects: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
 
@@ -223,43 +238,71 @@ async def _run_critic_round(instruction: str, model: str | LiteLlm) -> tuple[_Cr
     return _parse_verdict(final_text), prompt_tokens, completion_tokens
 
 
-def _fallback_verdict(static_findings: list[str]) -> _CriticVerdict:
-    """Used only if every round fails to parse - the critic must always
-    return something, never silently skip review (ADR-008's principle:
-    a code-enforced ceiling, not a request, and it must have a defined
-    result when that ceiling is hit)."""
-    if static_findings:
+def _fallback_verdict(static_findings: list[str], evidence_categories: set[str]) -> _CriticVerdict:
+    """Used when every round either fails to parse or is gated as an
+    unevidenced reject - the critic must always return something, never
+    silently skip review (ADR-008's principle: a code-enforced ceiling, not
+    a request, with a defined result when that ceiling is hit).
+
+    Gated on evidence_categories, not static_findings: static_findings also
+    holds confirmation-only text (e.g. "target column IS excluded") that is
+    not evidence of a defect, so checking it directly would let an
+    unevidenced reject survive relabelled as a fallback - exactly the
+    hallucination the gate in critique_run_async exists to stop (ADR-016).
+    The chosen category is real static evidence, never a hardcoded guess."""
+    if evidence_categories:
+        category = sorted(evidence_categories)[0]
         return _CriticVerdict(
             verdict="reject",
-            defect_category="score_mismatch",
-            defect="LLM critic review did not complete; falling back to the deterministic static findings, which found at least one issue.",
+            defect_category=category,
+            defect=f"LLM critic review did not produce a usable, evidence-backed verdict; falling back to the deterministic static check, which found evidence of {category}.",
             evidence="; ".join(static_findings),
         )
     return _CriticVerdict(
         verdict="accept",
         defect_category="none",
         defect="",
-        evidence="LLM critic review did not complete and the deterministic static checks found nothing.",
+        evidence="LLM critic review did not complete (or only rejected without static evidence) and the deterministic static checks found no real defect evidence.",
     )
 
 
 async def critique_run_async(
-    report: RunReport, profile_text: str, static_findings: list[str], model: str | LiteLlm
+    report: RunReport,
+    profile_text: str,
+    static_findings: list[str],
+    model: str | LiteLlm,
+    evidence_categories: set[str],
 ) -> Critique:
+    """evidence_categories is the set of defect_category values src/checks.py
+    actually found real evidence for on this run (checks.py's own
+    evidence_categories(), computed from the same static-check pass that
+    produced static_findings). A reject naming any other category - other
+    than the UNGATED_CATEGORIES exemptions - is unevidenced: treated like an
+    unparseable response and retried, closing the general hallucination
+    class rather than trusting any reject the LLM states (ADR-016)."""
     instruction = _build_critic_instruction(report, profile_text, static_findings)
     verdict: _CriticVerdict | None = None
     rounds_used = 0
     total_prompt_tokens = 0
     total_completion_tokens = 0
+    gated_rejects = 0
     for rounds_used in range(1, MAX_CRITIQUE_ROUNDS + 1):
         verdict, prompt_tokens, completion_tokens = await _run_critic_round(instruction, model)
         total_prompt_tokens += prompt_tokens
         total_completion_tokens += completion_tokens
+        if (
+            verdict is not None
+            and verdict.verdict == "reject"
+            and verdict.defect_category not in UNGATED_CATEGORIES
+            and verdict.defect_category not in evidence_categories
+        ):
+            gated_rejects += 1
+            verdict = None
         if verdict is not None:
             break
     fallback_used = verdict is None
     if verdict is None:
-        verdict = _fallback_verdict(static_findings)
+        verdict = _fallback_verdict(static_findings, evidence_categories)
     return Critique(
         verdict=verdict.verdict,
         defect_category=verdict.defect_category,
@@ -268,6 +311,7 @@ async def critique_run_async(
         static_findings=static_findings,
         rounds_used=rounds_used,
         fallback_used=fallback_used,
+        gated_rejects=gated_rejects,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
     )

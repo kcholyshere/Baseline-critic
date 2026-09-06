@@ -22,10 +22,12 @@ only, matching the proposal's own first-version scope.
 """
 
 import asyncio
+import hashlib
 import re
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,7 +43,7 @@ from mcp import StdioServerParameters
 from sklearn.metrics import accuracy_score, classification_report
 
 from src import config, dataset
-from src.checks import run_static_checks
+from src.checks import evidence_categories, run_static_checks
 from src.critic import Critique, critique_run_async
 from src.profiling import format_profile_for_prompt, profile_dataframe
 from src.report import RunReport, save_run
@@ -55,6 +57,21 @@ APP_NAME = "baseline_critic"
 USER_ID = "demo-user"
 
 
+@dataclass
+class RevisionContext:
+    """Carries what happened on a previous loop attempt into the next one's
+    instruction, so a revision round can react to the actual verdict rather
+    than repeating the same script blind."""
+
+    previous_code: str
+    previous_verdict: str  # "accept" or "reject"
+    defect_category: str
+    defect: str
+    evidence: str
+    previous_accuracy: float
+    prior_summaries: list[str]
+
+
 def _build_instruction(
     target_column: str,
     positive_class: str,
@@ -62,6 +79,7 @@ def _build_instruction(
     use_docs_tool: bool = False,
     inject_signature: bool = False,
     allow_retry: bool = False,
+    revision_context: RevisionContext | None = None,
 ) -> str:
     docs_tool_line = (
         "\nYou also have a get_api_signature tool that returns the real, "
@@ -94,6 +112,34 @@ def _build_instruction(
         "sentence summarising what the script did (features used, model "
         "type). Do not call the tool again once it succeeds."
     )
+    revision_block = ""
+    if revision_context is not None:
+        if revision_context.previous_verdict == "reject":
+            revision_block = f"""
+Your previous attempt at this dataset was REJECTED by the critic. Do not
+resubmit the same approach.
+Defect category: {revision_context.defect_category}
+Defect: {revision_context.defect}
+Evidence: {revision_context.evidence}
+
+Previous script:
+```python
+{revision_context.previous_code}
+```
+
+Write a new script that fixes this specific problem rather than repeating it.
+"""
+        else:
+            prior_summaries_text = "\n".join(f"- {s}" for s in revision_context.prior_summaries)
+            revision_block = f"""
+You already have an accepted baseline scoring {revision_context.previous_accuracy:.4f} holdout accuracy.
+Prior attempts so far:
+{prior_summaries_text}
+
+If you believe a genuinely different feature approach could improve on this
+score, try it. If you cannot think of a meaningfully different approach, it
+is fine to resubmit a similar one.
+"""
     return f"""\
 You are a baseline modelling agent for a tabular binary classification task.
 
@@ -118,7 +164,7 @@ holds two string values. The positive class (the outcome of interest) is
 5. Prints its own validation accuracy at a 0.5 probability threshold.
 6. Saves the trained booster with `booster.save_model("model.txt")` -
    LightGBM's own text format. Do not use pickle or joblib.
-
+{revision_block}
 {tool_call_policy}
 """
 
@@ -281,16 +327,21 @@ async def _run_baseline_async(
     inject_signature: bool = True,
     allow_retry: bool = True,
     run_critic: bool = True,
+    loop_id: str | None = None,
+    round_index: int = 0,
+    revised_from_run_id: str | None = None,
+    revision_context: RevisionContext | None = None,
 ) -> RunReport:
     started = time.monotonic()
 
     train_df = pd.read_csv(train_path)
+    dataset_id = hashlib.sha256(train_path.read_bytes()).hexdigest()[:12]
     profile = profile_dataframe(train_df, target_column)
     profile_text = format_profile_for_prompt(profile)
 
     capture: dict = {}
     instruction = _build_instruction(
-        target_column, positive_class, profile_text, use_docs_tool, inject_signature, allow_retry
+        target_column, positive_class, profile_text, use_docs_tool, inject_signature, allow_retry, revision_context
     )
     agent = _build_agent(capture, instruction, model, use_docs_tool, allow_retry)
     runner = InMemoryRunner(agent=agent, app_name=APP_NAME)
@@ -337,6 +388,10 @@ async def _run_baseline_async(
             modeller_prompt_tokens=modeller_prompt_tokens,
             modeller_completion_tokens=modeller_completion_tokens,
         )
+        report.dataset_id = dataset_id
+        report.loop_id = loop_id
+        report.round_index = round_index
+        report.revised_from_run_id = revised_from_run_id
     except Exception as exc:
         # A permanently failed run (non-zero returncode, missing model.txt, or
         # the agent never calling the tool at all) must still leave a JSON
@@ -364,6 +419,10 @@ async def _run_baseline_async(
             failed=True,
             failure_reason=str(exc),
         )
+        failure_report.dataset_id = dataset_id
+        failure_report.loop_id = loop_id
+        failure_report.round_index = round_index
+        failure_report.revised_from_run_id = revised_from_run_id
         save_run(failure_report)
         raise
 
@@ -371,7 +430,10 @@ async def _run_baseline_async(
         static_findings = run_static_checks(
             report.generated_code, train_path, target_column, report.stdout, report.holdout_accuracy
         )
-        critique = await critique_run_async(report, profile_text, static_findings, model)
+        static_evidence = evidence_categories(
+            report.generated_code, train_path, target_column, report.stdout, report.holdout_accuracy
+        )
+        critique = await critique_run_async(report, profile_text, static_findings, model, static_evidence)
         report.critique = critique.to_dict()
 
     save_run(report)
@@ -396,7 +458,10 @@ async def rescore_run_async(
     static_findings = run_static_checks(
         report.generated_code, train_path, report.target_column, report.stdout, report.holdout_accuracy
     )
-    return await critique_run_async(report, profile_text, static_findings, _resolve_model(model))
+    static_evidence = evidence_categories(
+        report.generated_code, train_path, report.target_column, report.stdout, report.holdout_accuracy
+    )
+    return await critique_run_async(report, profile_text, static_findings, _resolve_model(model), static_evidence)
 
 
 def _resolve_model(model: str | LiteLlm | None) -> str | LiteLlm:
