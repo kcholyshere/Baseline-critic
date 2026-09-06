@@ -516,6 +516,7 @@ async def _run_baseline_async(
             profile["target"]["is_imbalanced"],
             time_column,
             task_type,
+            holdout=holdout,
         )
         critique = await critique_run_async(report, profile_text, static_findings, model)
         report.critique = critique.to_dict()
@@ -542,6 +543,11 @@ async def rescore_run_async(
     task_type = report.task_type or "classification"
     profile = profile_dataframe(train_df, report.target_column, time_column, task_type)
     profile_text = format_profile_for_prompt(profile)
+    # holdout is left at its default (None): the original holdout split isn't
+    # reliably reconstructable here for an uploaded dataset (only the demo
+    # dataset's is, via dataset.get_holdout()), so _check_duplicate_rows_across_split
+    # (ADR-020) stays silent on a rescore - an honest, deliberate gap, not a
+    # false sense of coverage.
     static_findings = run_checks(
         report.generated_code,
         train_path,

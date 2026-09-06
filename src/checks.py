@@ -8,10 +8,13 @@ actually observed in generated code (see references/local-model-benchmarks.md
 and data/processed/runs/*.json), not a hypothetical. Keep it dumb and simple
 first, the same principle the sandbox itself was built on (ADR-003).
 
-One check (_check_feature_target_correlation, ADR-014) reads the actual
-training data rather than the code text - the eval harness's target_leakage
-fixture uses code byte-identical to the clean fixture, only the CSV
-differs, so no code-level check can ever distinguish them (ADR-010).
+Two checks read actual data rather than the code text - the eval harness's
+target_leakage fixture uses code byte-identical to the clean fixture, only
+the CSV differs, so no code-level check can ever distinguish them (ADR-010):
+_check_feature_target_correlation (ADR-014) and _check_duplicate_rows_across_split
+(ADR-020, grouped/clustered-row leakage - deliberately scoped to exact
+duplicate feature rows, not a naming guess at which column is a group/entity
+id, which ADR-014 already rejected for the same reason for temporal_leakage).
 
 Each flagging check (not the confirmation-only ones) is tagged with the
 defect_category it is evidence for. src/critic.py's reject-gate (ADR-016)
@@ -39,6 +42,12 @@ import pandas as pd
 
 VAL_HOLDOUT_GAP_THRESHOLD = 0.08
 LEAKAGE_CORRELATION_THRESHOLD = 0.97
+# Decimal places numeric feature columns are rounded to before an exact-match
+# comparison in _check_duplicate_rows_across_split - well above the precision
+# floor a CSV round-trip is measured to preserve (ADR-020), far finer than any
+# real duplicate-vs-distinct distinction a continuous feature would ever turn
+# on.
+ROUND_TRIP_PRECISION = 9
 
 _PUBLIC_DATASET_PATTERN = re.compile(r"\b(fetch_openml|load_breast_cancer|load_iris|load_diabetes|load_wine)\b|from\s+sklearn\.datasets\s+import")
 _FILE_READ_PATTERN = re.compile(r"(?:read_csv|read_json|read_parquet)\(\s*['\"]([^'\"]+)['\"]")
@@ -388,6 +397,93 @@ def _check_feature_target_correlation(
     )
 
 
+def _check_duplicate_rows_across_split(
+    train_path: Path, holdout: pd.DataFrame | None, target_column: str
+) -> StaticFinding | None:
+    """Flags feature rows that appear identically on both sides of the
+    train/holdout split - the data-level signature of the same entity's rows
+    (e.g. a repeat visit or session) leaking across the split, letting the
+    model partly memorise the holdout instances it's meant to be evaluated
+    on (TODOS.md Phase 6, "grouped/clustered rows").
+
+    Named precisely for what it actually detects, not the broader "any
+    repeat entity" claim: a repeat entity with slightly different values
+    per visit (e.g. differing lab results) produces no exact duplicate and
+    is not caught by this check - the same narrowing-to-what's-checkable
+    trade-off ADR-015 made for score_mismatch and ADR-018 made for
+    temporal_leakage, rather than a threshold with no safe margin (ADR-014's
+    reasoning) or a naming guess at which column is a group/entity id
+    (rejected outright as a design for this project, ADR-020, the same
+    reasoning ADR-014 already used to reject a naming heuristic for
+    temporal_leakage).
+
+    Compares feature columns only (excludes target_column, which is
+    expected to repeat across many unrelated rows and carries no identity
+    signal). Silent when holdout isn't available (rescore_run_async can't
+    reliably reconstruct the original holdout for an uploaded dataset) or
+    shares no feature columns with train_path - fails closed like every
+    other check in this module on missing data.
+
+    Verified empirically (ADR-020) against the real evaluation-harness
+    fixture sources before this check was written: a 30-row duplicate
+    injection reliably produces overlap under the project's fixed SEED (12
+    rows on Breast Cancer Wisconsin, 13 on the diabetes regression source),
+    while every existing fixture - clean and every other injected defect,
+    both task types - produces zero overlap, confirming this check cannot
+    misattribute evidence to an unrelated category.
+
+    Numeric columns are rounded to ROUND_TRIP_PRECISION decimal places
+    before comparing - found necessary live, not a hypothetical: train_path
+    is read back from a CSV round-trip while holdout stays in memory, and
+    the diabetes regression fixture's scaled features (~17 significant
+    digits) genuinely lose precision in that round-trip (confirmed directly:
+    0.009015598825267658 in memory becomes 0.0090155988252676 read back),
+    which silently zeroed out every real overlap before this fix. The
+    breast cancer fixture's already-limited-precision floats never showed
+    the problem, which is exactly why it needed a second dataset to surface
+    - the chosen precision is well above the round-trip's own precision
+    floor (verified 6-12 decimal places all recover the same true overlap
+    count) and far finer than any real duplicate-vs-distinct distinction
+    a continuous feature would ever turn on."""
+    if holdout is None or holdout.empty:
+        return None
+    try:
+        train_df = pd.read_csv(train_path)
+    except Exception:
+        return None
+    # Excludes datetime-dtype columns: a CSV round-trip reads them back as
+    # plain strings, so train_df and the still-in-memory holdout disagree on
+    # dtype for the same column - pandas' merge refuses to compare across
+    # that mismatch outright (observed live against the temporal_leakage
+    # fixture's synthetic record_date column) rather than simply finding no
+    # match, which a plain except Exception would silently paper over.
+    feature_columns = [
+        c
+        for c in train_df.columns
+        if c != target_column and c in holdout.columns and not pd.api.types.is_datetime64_any_dtype(holdout[c])
+    ]
+    if not feature_columns:
+        return None
+    train_features = train_df[feature_columns].copy()
+    holdout_features = holdout[feature_columns].copy()
+    for column in feature_columns:
+        if pd.api.types.is_numeric_dtype(train_features[column]):
+            train_features[column] = train_features[column].round(ROUND_TRIP_PRECISION)
+            holdout_features[column] = holdout_features[column].round(ROUND_TRIP_PRECISION)
+    try:
+        overlap = train_features.drop_duplicates().merge(holdout_features)
+    except Exception:
+        return None
+    if overlap.empty:
+        return None
+    return StaticFinding(
+        f"{len(overlap)} holdout row(s) have feature values identical to a training row - the "
+        "classic signature of the same entity's rows (e.g. a repeat visit or session) appearing "
+        "on both sides of the split.",
+        category="duplicate_row_leakage",
+    )
+
+
 def _run_all_checks(
     generated_code: str,
     train_path: Path,
@@ -397,6 +493,7 @@ def _run_all_checks(
     is_imbalanced: bool,
     time_column: str | None,
     task_type: str,
+    holdout: pd.DataFrame | None = None,
 ) -> list[StaticFinding]:
     """Runs every static check once and returns the findings that fired -
     shared by run_static_checks (display text) and evidence_categories
@@ -416,6 +513,7 @@ def _run_all_checks(
         _check_feature_target_correlation(train_path, target_column, task_type),
         scored_on_training_rows_finding,
         _check_val_holdout_gap(stdout, holdout_accuracy, scored_on_training_rows_finding is not None, task_type),
+        _check_duplicate_rows_across_split(train_path, holdout, target_column),
     ]
     return [finding for finding in checks if finding is not None]
 
@@ -429,6 +527,7 @@ def run_checks(
     is_imbalanced: bool = False,
     time_column: str | None = None,
     task_type: str = "classification",
+    holdout: pd.DataFrame | None = None,
 ) -> list[StaticFinding]:
     """Runs every static check once and returns the raw findings. Callers
     that need display text, evidence categories, or both (src/critic.py's
@@ -436,5 +535,13 @@ def run_checks(
     this one list rather than calling separate functions that would each
     re-run every check independently."""
     return _run_all_checks(
-        generated_code, train_path, target_column, stdout, holdout_accuracy, is_imbalanced, time_column, task_type
+        generated_code,
+        train_path,
+        target_column,
+        stdout,
+        holdout_accuracy,
+        is_imbalanced,
+        time_column,
+        task_type,
+        holdout,
     )

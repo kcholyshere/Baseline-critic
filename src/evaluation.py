@@ -361,6 +361,25 @@ def _inject_temporal_leakage(df: pd.DataFrame, target_column: str, positive_clas
     return df
 
 
+def _inject_duplicate_row_leakage(df: pd.DataFrame, target_column: str, positive_class: str) -> pd.DataFrame:
+    """Duplicates 30 sampled rows before the split - the same entity's rows
+    appearing twice in the source data, once on each side of the split,
+    once dataset._split_indices runs on the enlarged dataframe. Shared by
+    both task-type fixtures (unlike every other injector pair in this file)
+    since the defect is purely structural - which rows repeat - and doesn't
+    depend on target_column or positive_class at all.
+
+    Empirically verified before src/checks.py's matching check was written
+    (ADR-020): under this project's fixed SEED, this reliably produces
+    overlapping train/holdout rows on both real fixture sources (12 on
+    Breast Cancer Wisconsin, 13 on the diabetes regression source), while
+    every existing fixture - clean and every other injected defect, both
+    task types - produces zero overlap."""
+    df = df.copy().reset_index(drop=True)
+    duplicate_rows = df.sample(n=30, random_state=0)
+    return pd.concat([df, duplicate_rows], ignore_index=True)
+
+
 def _load_regression_source() -> pd.DataFrame:
     """Regression-track equivalent of dataset._load_source() - that one is
     classification-only (breast cancer) and frozen, so this is its own
@@ -428,6 +447,15 @@ FIXTURES: list[FixtureSpec] = [
         _inject_temporal_leakage,
     ),
     FixtureSpec(
+        "duplicate_row_leakage",
+        "reject",
+        "30 rows are duplicated before the split, so the same feature values appear on both "
+        "sides of train/holdout - the data-level signature of a repeat entity's rows leaking "
+        "across the split.",
+        _TRAIN_SCRIPT,
+        _inject_duplicate_row_leakage,
+    ),
+    FixtureSpec(
         "train_test_contamination",
         "reject",
         "Script ignores the given train CSV and trains on the full public dataset, including the "
@@ -485,6 +513,16 @@ FIXTURES: list[FixtureSpec] = [
         "the point being predicted.",
         _REGRESSION_TRAIN_SCRIPT,
         _inject_regression_temporal_leakage,
+        task_type="regression",
+    ),
+    FixtureSpec(
+        "duplicate_row_leakage",
+        "reject",
+        "30 rows are duplicated before the split, so the same feature values appear on both "
+        "sides of train/holdout. Same structural defect and same shared injector "
+        "(_inject_duplicate_row_leakage) as the classification track.",
+        _REGRESSION_TRAIN_SCRIPT,
+        _inject_duplicate_row_leakage,
         task_type="regression",
     ),
     FixtureSpec(
@@ -694,7 +732,7 @@ class FixtureOutcome:
 async def _run_fixture_trials(
     report: RunReport, spec: FixtureSpec, trials_per_fixture: int, model: str | LiteLlm
 ) -> FixtureOutcome:
-    train_df, _ = get_fixture_train_holdout(spec)
+    train_df, holdout_df = get_fixture_train_holdout(spec)
     train_path = fixture_train_path(spec.task_type, spec.category)
     target_column = REGRESSION_TARGET_COLUMN if spec.task_type == "regression" else dataset.TARGET_COLUMN
     profile = profile_dataframe(train_df, target_column, task_type=spec.task_type)
@@ -711,6 +749,7 @@ async def _run_fixture_trials(
         report.holdout_accuracy,
         is_imbalanced,
         task_type=spec.task_type,
+        holdout=holdout_df,
     )
     profile_text = format_profile_for_prompt(profile)
 

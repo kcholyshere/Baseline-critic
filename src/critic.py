@@ -49,6 +49,7 @@ DefectCategory = Literal[
     "target_leakage",
     "train_test_contamination",
     "temporal_leakage",
+    "duplicate_row_leakage",
     "unseeded_randomness",
     "degenerate_split",
     "score_mismatch",
@@ -143,9 +144,10 @@ The agent's one-sentence summary of what it did:
 {results_block}
 
 Look specifically for: leakage, train/test contamination, a target column
-smuggled into the features, temporal leakage, unseeded randomness, and any
-mismatch between what the code claims to measure and what it actually
-measures. If you find a real defect, reject with exactly one
+smuggled into the features, temporal leakage, identical feature rows
+appearing on both sides of the train/holdout split, unseeded randomness,
+and any mismatch between what the code claims to measure and what it
+actually measures. If you find a real defect, reject with exactly one
 defect_category and one sentence naming it in "defect". If nothing above
 gives you a concrete reason to doubt the result, accept - do not reject on
 vague suspicion alone, since a dataset can legitimately be easy.
@@ -188,6 +190,8 @@ _CATEGORY_ALIASES = {
     "unseeded randomness": "unseeded_randomness",
     "degenerate split": "degenerate_split",
     "score mismatch": "score_mismatch",
+    "duplicate row leakage": "duplicate_row_leakage",
+    "row duplication": "duplicate_row_leakage",
 }
 
 
