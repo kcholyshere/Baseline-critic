@@ -2,17 +2,25 @@
 script - no LLM call, sitting beside profiling.py as another "tool the
 model never has to guess at" and the critic never has to notice by eye.
 
-These are heuristics over the script's text, not a proof of correctness -
-each one targets a specific, real pattern this project has actually
-observed in generated code (see references/local-model-benchmarks.md and
-data/processed/runs/*.json), not a hypothetical. Keep it dumb and simple
+Most of these are heuristics over the script's text, not a proof of
+correctness - each one targets a specific, real pattern this project has
+actually observed in generated code (see references/local-model-benchmarks.md
+and data/processed/runs/*.json), not a hypothetical. Keep it dumb and simple
 first, the same principle the sandbox itself was built on (ADR-003).
+
+One check (_check_feature_target_correlation, ADR-014) reads the actual
+training data rather than the code text - the eval harness's target_leakage
+fixture uses code byte-identical to the clean fixture, only the CSV
+differs, so no code-level check can ever distinguish them (ADR-010).
 """
 
 import re
 from pathlib import Path
 
+import pandas as pd
+
 VAL_HOLDOUT_GAP_THRESHOLD = 0.08
+LEAKAGE_CORRELATION_THRESHOLD = 0.97
 
 _PUBLIC_DATASET_PATTERN = re.compile(r"\b(fetch_openml|load_breast_cancer|load_iris|load_diabetes|load_wine)\b|from\s+sklearn\.datasets\s+import")
 _FILE_READ_PATTERN = re.compile(r"(?:read_csv|read_json|read_parquet)\(\s*['\"]([^'\"]+)['\"]")
@@ -116,6 +124,49 @@ def _check_val_holdout_gap(stdout: str, holdout_accuracy: float) -> str | None:
     return None
 
 
+def _check_feature_target_correlation(train_path: Path, target_column: str) -> str | None:
+    """Flags a feature whose correlation with the (binarised) target exceeds
+    LEAKAGE_CORRELATION_THRESHOLD - the classic "the answer got left in a
+    feature" pattern. Threshold picked with a wide, measured safety margin:
+    on the real Breast Cancer Wisconsin data, the strongest legitimate
+    predictor ("worst concave points") correlates at 0.786; the eval
+    harness's injected target_leakage column ("diagnosis_score" - label
+    plus small noise) correlates at 0.9998. 0.97 sits far above the former
+    and comfortably below the latter, so this only catches a near-duplicate
+    of the label, not a merely strong feature.
+
+    Deliberately does not attempt to catch temporal_leakage (ADR-010's
+    injected target-rate encoding correlates at only 0.830 - too close to
+    the legitimate 0.786 ceiling to set a safe threshold for; a check with
+    a threshold low enough to catch it would risk flagging a genuinely
+    strong predictor on a different dataset). That category stays
+    critic-only, by design, not by oversight."""
+    try:
+        df = pd.read_csv(train_path)
+    except Exception:
+        return None
+    if target_column not in df.columns:
+        return None
+    values = df[target_column].dropna().unique()
+    if len(values) != 2:
+        return None
+    label = (df[target_column] == values[0]).astype(int)
+    numeric_features = df.drop(columns=[target_column]).select_dtypes(include="number")
+    if numeric_features.empty:
+        return None
+    correlations = numeric_features.corrwith(label).abs()
+    offenders = correlations[correlations > LEAKAGE_CORRELATION_THRESHOLD]
+    if offenders.empty:
+        return None
+    worst_feature = offenders.idxmax()
+    return (
+        f"Feature '{worst_feature}' correlates with the target at {offenders[worst_feature]:.4f} "
+        f"(threshold {LEAKAGE_CORRELATION_THRESHOLD}) - near-perfect correlation with the label is "
+        "the classic target-leakage signature (a copy of the answer left in the features), well "
+        "beyond what a legitimately predictive feature reaches on real data."
+    )
+
+
 def run_static_checks(
     generated_code: str,
     train_path: Path,
@@ -132,6 +183,7 @@ def run_static_checks(
         _check_public_dataset_import(generated_code),
         _check_target_column_referenced(generated_code, target_column),
         _check_target_excluded_from_features(generated_code, target_column),
+        _check_feature_target_correlation(train_path, target_column),
         _check_val_holdout_gap(stdout, holdout_accuracy),
     ]
     return [finding for finding in checks if finding is not None]
