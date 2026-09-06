@@ -170,8 +170,7 @@ from sklearn.model_selection import train_test_split
 
 df = pd.read_csv({train_path!r})
 y = (df[{target_column!r}] == {positive_class!r}).astype(int)
-feature_cols = df.columns.difference([{target_column!r}])
-X = df[feature_cols].select_dtypes(include="number")
+X = df.drop(columns=[{target_column!r}]).select_dtypes(include="number")
 
 X_train, X_val, y_train, y_val = train_test_split(
     X, y, test_size=0.2, random_state=42, stratify=y
@@ -184,8 +183,8 @@ booster = lgb.train(
     num_boost_round=100,
     valid_sets=[val_set],
 )
-preds = (booster.predict(X_val) >= 0.5).astype(int)
-accuracy = (preds == y_val).mean()
+preds = (booster.predict(X_train) >= 0.5).astype(int)
+accuracy = (preds == y_train).mean()
 print(f"Validation accuracy: {{accuracy:.4f}}")
 booster.save_model("model.txt")
 '''
@@ -262,11 +261,13 @@ FIXTURES: list[FixtureSpec] = [
     FixtureSpec(
         "score_mismatch",
         "reject",
-        "Feature list built via .columns.difference(), reordering columns alphabetically - the "
-        "risky pattern behind the real ADR-009 bug. No live scoring error remains here, since "
-        "ADR-009's own feature-reindexing fix (src/agent.py) already defends against it - this "
-        "tests whether the critic still flags the pattern itself, not whether it can catch a "
-        "live accuracy drop.",
+        "Script scores itself on the training rows it just fit on, then prints that number "
+        "labelled 'Validation accuracy' - a genuine, code-visible gap between what the code "
+        "claims to measure and what it actually measures. Deliberately independent of "
+        "holdout_accuracy: an earlier version of this fixture only reordered feature columns "
+        "(the ADR-009 pattern, already defended against by src/agent.py's reindexing fix), which "
+        "left no live scoring error to detect and left the fixture numerically identical to the "
+        "clean fixture on the one signal the critic actually used - see agent_docs/decisions.md.",
         _SCORE_MISMATCH_SCRIPT,
     ),
 ]

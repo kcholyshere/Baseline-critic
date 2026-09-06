@@ -102,7 +102,53 @@ def _check_target_excluded_from_features(code: str, target_column: str) -> str |
     return None
 
 
-def _check_val_holdout_gap(stdout: str, holdout_accuracy: float) -> str | None:
+def _check_scored_on_training_rows(code: str) -> str | None:
+    """Flags a script whose final .predict() call scores the exact same
+    feature variable it just built the training lgb.Dataset from, instead
+    of the held-back validation split - a genuine claim-vs-reality mismatch
+    (the eval harness's score_mismatch fixture, agent_docs/decisions.md),
+    independent of any accuracy number.
+
+    A magnitude-based check on the resulting accuracy gap was tried first
+    and rejected: on real data this defect produces a gap of only ~0.035,
+    too close to a genuinely clean run's ordinary sampling variance
+    (~0.002) to set a safe threshold between them - the same reasoning that
+    already ruled out a correlation threshold for temporal_leakage. This
+    structural check needs no threshold at all."""
+    train_match = re.search(r"\.Dataset\(\s*(\w+)\s*,\s*label\s*=\s*(\w+)\s*\)", code)
+    if train_match is None:
+        return None
+    train_features_var = train_match.group(1)
+    predict_calls = re.findall(r"\.predict\(\s*(\w+)\s*\)", code)
+    if predict_calls and predict_calls[-1] == train_features_var:
+        return (
+            f"The script's final .predict() call scores '{train_features_var}' - the same "
+            "features it just trained on - rather than a held-back validation split, so the "
+            "reported accuracy measures fit to training data, not generalisation "
+            "(defect_category: score_mismatch)."
+        )
+    return None
+
+
+def _check_val_holdout_gap(stdout: str, holdout_accuracy: float, scored_on_training_rows: bool) -> str | None:
+    """Two-sided, unlike the checks above it: a small gap is stated as a
+    confirmed fact, not left silent, because the eval harness (Phase 5)
+    found the critic treating any difference at all - even a ~0.002 gap
+    identical to one seen on a clean run - as evidence of a defect. stdout's
+    number and holdout_accuracy are never the same measurement: stdout is
+    the script's own internal validation fold (a slice of the training
+    data), holdout_accuracy is the harness scoring the saved model against
+    rows the script never saw. A small gap between two different samples is
+    normal variance, not a defect signal - only a gap past
+    VAL_HOLDOUT_GAP_THRESHOLD is.
+
+    scored_on_training_rows suppresses the "normal, don't reject" half:
+    when _check_scored_on_training_rows has already found the script
+    scoring itself on training rows, the gap is not ordinary sampling
+    variance, and confirming it as harmless would contradict that other
+    finding in the same prompt - the critic is told to trust static
+    findings over its own reading, so two that disagree is worse than one
+    that's silent."""
     accuracy_lines = [line for line in stdout.splitlines() if "accuracy" in line.lower()]
     if not accuracy_lines:
         return None
@@ -121,7 +167,14 @@ def _check_val_holdout_gap(stdout: str, holdout_accuracy: float) -> str | None:
             "threshold - the reported validation score may not be a reliable estimate of the "
             "real result, in either direction."
         )
-    return None
+    if scored_on_training_rows:
+        return None
+    return (
+        f"Internal validation accuracy ({val_accuracy:.4f}) and real holdout accuracy "
+        f"({holdout_accuracy:.4f}) differ by {gap:.4f} - within the normal range for two "
+        "different samples of similar size. They are not the same measurement and are not "
+        "expected to match exactly; do not reject on this difference alone."
+    )
 
 
 def _check_feature_target_correlation(train_path: Path, target_column: str) -> str | None:
@@ -175,6 +228,7 @@ def run_static_checks(
     holdout_accuracy: float,
 ) -> list[str]:
     """Runs every static check and returns the findings that actually fired."""
+    scored_on_training_rows_finding = _check_scored_on_training_rows(generated_code)
     checks = [
         _check_column_order_instability(generated_code),
         _check_missing_stratify(generated_code),
@@ -184,6 +238,7 @@ def run_static_checks(
         _check_target_column_referenced(generated_code, target_column),
         _check_target_excluded_from_features(generated_code, target_column),
         _check_feature_target_correlation(train_path, target_column),
-        _check_val_holdout_gap(stdout, holdout_accuracy),
+        scored_on_training_rows_finding,
+        _check_val_holdout_gap(stdout, holdout_accuracy, scored_on_training_rows_finding is not None),
     ]
     return [finding for finding in checks if finding is not None]
