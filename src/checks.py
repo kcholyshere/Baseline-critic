@@ -15,7 +15,12 @@ from pathlib import Path
 VAL_HOLDOUT_GAP_THRESHOLD = 0.08
 
 _PUBLIC_DATASET_PATTERN = re.compile(r"\b(fetch_openml|load_breast_cancer|load_iris|load_diabetes|load_wine)\b|from\s+sklearn\.datasets\s+import")
-_FILE_READ_PATTERN = re.compile(r"(?:read_csv|read_json|read_parquet|open)\(\s*['\"]([^'\"]+)['\"]")
+_FILE_READ_PATTERN = re.compile(r"(?:read_csv|read_json|read_parquet)\(\s*['\"]([^'\"]+)['\"]")
+# Ordering-dependent heuristic: assumes the reported accuracy is always the
+# LAST decimal on the line, i.e. any threshold value (e.g. "0.5") is printed
+# before it. True for every real output observed so far, but not guaranteed
+# by the modeller's instruction - a model that ever prints accuracy before
+# a threshold on the same line would silently misfire this extraction.
 _DECIMAL_PATTERN = re.compile(r"\d\.\d+")
 
 

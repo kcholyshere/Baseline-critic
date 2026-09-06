@@ -52,6 +52,10 @@ def get_api_signature(library: str, symbol: str) -> str:
         if obj is None:
             return f"'{symbol}' not found in {library} {module.__version__}."
 
+    owning_module = getattr(obj, "__module__", "") or ""
+    if not owning_module.startswith(_ALLOWED_MODULES[library]):
+        return f"'{symbol}' not found in {library} {module.__version__}."
+
     try:
         signature = str(inspect.signature(obj))
     except (TypeError, ValueError):

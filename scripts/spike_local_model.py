@@ -144,6 +144,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--trial":
+        # Internal-only: always invoked by _run_one_trial with exactly these
+        # five args in this order. Asserted rather than left to a bare
+        # IndexError, so a future edit to either side that drifts out of
+        # sync fails with a clear message instead of a confusing traceback.
+        assert len(sys.argv) == 6, f"--trial expects 5 args, got {len(sys.argv) - 2}: {sys.argv[2:]}"
         _trial_subprocess_main(
             model_uri=sys.argv[2],
             use_docs_tool=sys.argv[3] == "True",

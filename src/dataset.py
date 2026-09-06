@@ -36,12 +36,34 @@ def _load_source() -> pd.DataFrame:
 
 
 def _split_indices(df: pd.DataFrame, target_column: str) -> tuple[pd.Index, pd.Index]:
-    return train_test_split(
+    train_idx, holdout_idx = train_test_split(
         df.index,
         test_size=HOLDOUT_FRACTION,
         random_state=SEED,
         stratify=df[target_column],
     )
+
+    all_classes = set(df[target_column].dropna().unique())
+    train_classes = set(df.loc[train_idx, target_column].dropna().unique())
+    holdout_classes = set(df.loc[holdout_idx, target_column].dropna().unique())
+
+    missing_from_train = all_classes - train_classes
+    missing_from_holdout = all_classes - holdout_classes
+    if missing_from_train or missing_from_holdout:
+        problems = []
+        if missing_from_train:
+            values = ", ".join(f'"{v}"' for v in sorted(missing_from_train, key=str))
+            problems.append(f"missing from the train split: {values}")
+        if missing_from_holdout:
+            values = ", ".join(f'"{v}"' for v in sorted(missing_from_holdout, key=str))
+            problems.append(f"missing from the holdout split: {values}")
+        raise ValueError(
+            f'"{target_column}" has a class too small for a reliable train/holdout split - '
+            + "; ".join(problems)
+            + ". Add more rows for the affected class, or use a larger holdout fraction."
+        )
+
+    return train_idx, holdout_idx
 
 
 def build_train_artifact(path=TRAIN_PATH) -> None:

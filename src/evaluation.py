@@ -50,7 +50,7 @@ from src.agent import build_run_report_from_execution
 from src.checks import run_static_checks
 from src.critic import Critique, critique_run_async
 from src.profiling import format_profile_for_prompt, profile_dataframe
-from src.report import RunReport
+from src.report import RunReport, _atomic_write_json, _read_json_or_none
 from src.services.code_execution import run_code
 
 FIXTURES_DIR = config.PROCESSED_DATA_DIR / "eval_fixtures"
@@ -465,15 +465,17 @@ def _save_summary(summary: dict) -> Path:
     SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
     stamp = summary["generated_at"].replace(":", "-")
     timestamped_path = SUMMARIES_DIR / f"{stamp}.json"
-    timestamped_path.write_text(json.dumps(summary, indent=2))
-    LATEST_SUMMARY_PATH.write_text(json.dumps(summary, indent=2))
+    _atomic_write_json(timestamped_path, summary)
+    _atomic_write_json(LATEST_SUMMARY_PATH, summary)
     return timestamped_path
 
 
 def load_latest_summary() -> dict | None:
+    """Returns the latest evaluation summary, or None if no evaluation has
+    run yet (or the latest summary file on disk fails to parse)."""
     if not LATEST_SUMMARY_PATH.exists():
         return None
-    return json.loads(LATEST_SUMMARY_PATH.read_text())
+    return _read_json_or_none(LATEST_SUMMARY_PATH)
 
 
 async def run_evaluation_async(

@@ -5,6 +5,8 @@ against the same contract instead of each inventing their own dict shape.
 """
 
 import json
+import os
+import tempfile
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -15,6 +17,33 @@ from src.config import PROCESSED_DATA_DIR
 
 RUNS_DIR = PROCESSED_DATA_DIR / "runs"
 RESCORINGS_DIR = PROCESSED_DATA_DIR / "rescorings"
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Writes JSON atomically: a full write to a temp file in the same
+    directory (so the rename is on the same filesystem), then os.replace()
+    into place. A killed process or an interrupted Streamlit rerun can never
+    leave a truncated file at `path` - either the old content is there, or
+    the new content is, never a half-written mix of both."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(data, indent=2))
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+def _read_json_or_none(path: Path) -> dict | None:
+    """Reads and parses JSON, returning None (instead of raising) if the
+    file is missing, unreadable, or corrupt - so one bad file can be
+    skipped rather than crashing every caller that lists runs/rescorings."""
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 @dataclass
@@ -37,6 +66,8 @@ class RunReport:
     critique: dict | None = None
     modeller_prompt_tokens: int = 0
     modeller_completion_tokens: int = 0
+    failed: bool = False
+    failure_reason: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -46,27 +77,43 @@ def save_run(report: RunReport) -> Path:
     """Writes the run record as plain JSON, matching Research-agent's evaluation harness."""
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     path = RUNS_DIR / f"{report.run_id}.json"
-    path.write_text(json.dumps(report.to_dict(), indent=2))
+    _atomic_write_json(path, report.to_dict())
     return path
 
 
 def load_latest_run() -> RunReport | None:
-    """Returns the most recently written run record, or None if no run exists yet."""
+    """Returns the most recently written run record, or None if no run exists yet
+    (or the most recent file on disk fails to parse)."""
     if not RUNS_DIR.exists():
         return None
-    run_files = sorted(RUNS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
-    if not run_files:
-        return None
-    data = json.loads(run_files[-1].read_text())
-    return RunReport(**data)
+    run_files = sorted(RUNS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in run_files:
+        data = _read_json_or_none(path)
+        if data is not None:
+            try:
+                return RunReport(**data)
+            except TypeError:
+                continue
+    return None
 
 
 def list_runs() -> list[RunReport]:
-    """Returns all saved run records, most recent first."""
+    """Returns all saved run records, most recent first. A file that fails to
+    parse (e.g. left truncated by an interrupted write) is skipped rather
+    than raised, so one corrupted run can't take down the whole list."""
     if not RUNS_DIR.exists():
         return []
     run_files = sorted(RUNS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return [RunReport(**json.loads(p.read_text())) for p in run_files]
+    runs = []
+    for path in run_files:
+        data = _read_json_or_none(path)
+        if data is None:
+            continue
+        try:
+            runs.append(RunReport(**data))
+        except TypeError:
+            continue
+    return runs
 
 
 def save_rescoring(run_id: str, critique: dict, model: str) -> Path:
@@ -85,16 +132,17 @@ def save_rescoring(run_id: str, critique: dict, model: str) -> Path:
         "critique": critique,
     }
     path = RESCORINGS_DIR / f"{run_id}-{rescoring_id}.json"
-    path.write_text(json.dumps(record, indent=2))
+    _atomic_write_json(path, record)
     return path
 
 
 def list_rescorings(run_id: str | None = None) -> list[dict]:
-    """Returns saved rescoring records, most recent first, optionally filtered to one run_id."""
+    """Returns saved rescoring records, most recent first, optionally filtered
+    to one run_id. A file that fails to parse is skipped rather than raised."""
     if not RESCORINGS_DIR.exists():
         return []
     files = sorted(RESCORINGS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    records = [json.loads(p.read_text()) for p in files]
+    records = [r for r in (_read_json_or_none(p) for p in files) if r is not None]
     if run_id is not None:
         records = [r for r in records if r["run_id"] == run_id]
     return records

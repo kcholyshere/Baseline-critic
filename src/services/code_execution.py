@@ -9,13 +9,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 TIMEOUT_SECONDS = 120
 MAX_CALLS_PER_SESSION = 20
+MAX_ARTIFACT_BYTES = 50 * 1024 * 1024  # 50 MB per artifact file
 
 _call_count = 0
+_call_count_lock = threading.Lock()
 
 
 class TrainingBudgetExceeded(Exception):
@@ -41,11 +44,12 @@ def run_code(code: str) -> ExecutionResult:
     any file the code wrote is captured into `artifacts` first.
     """
     global _call_count
-    if _call_count >= MAX_CALLS_PER_SESSION:
-        raise TrainingBudgetExceeded(
-            f"Training budget of {MAX_CALLS_PER_SESSION} calls exhausted this session."
-        )
-    _call_count += 1
+    with _call_count_lock:
+        if _call_count >= MAX_CALLS_PER_SESSION:
+            raise TrainingBudgetExceeded(
+                f"Training budget of {MAX_CALLS_PER_SESSION} calls exhausted this session."
+            )
+        _call_count += 1
 
     scratch_dir = Path(tempfile.mkdtemp(prefix="baseline-critic-run-"))
     script_path = scratch_dir / "run.py"
@@ -68,11 +72,22 @@ def run_code(code: str) -> ExecutionResult:
             stderr = (exc.stderr or "") + f"\n[timed out after {TIMEOUT_SECONDS}s]"
             returncode = -1
 
-        artifacts = {
-            str(f.relative_to(scratch_dir)): f.read_bytes()
-            for f in scratch_dir.rglob("*")
-            if f.is_file() and f != script_path
-        }
+        artifacts: dict[str, bytes] = {}
+        skipped: list[str] = []
+        for f in scratch_dir.rglob("*"):
+            if not f.is_file() or f == script_path:
+                continue
+            size = f.stat().st_size
+            if size > MAX_ARTIFACT_BYTES:
+                skipped.append(f"{f.relative_to(scratch_dir)} ({size} bytes)")
+                continue
+            artifacts[str(f.relative_to(scratch_dir))] = f.read_bytes()
+
+        if skipped:
+            stderr += (
+                f"\n[skipped {len(skipped)} artifact(s) exceeding "
+                f"{MAX_ARTIFACT_BYTES} byte cap: {', '.join(skipped)}]"
+            )
     finally:
         shutil.rmtree(scratch_dir, ignore_errors=True)
 

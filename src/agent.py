@@ -257,6 +257,14 @@ def _reindex_to_booster_feature_order(X: pd.DataFrame, booster: lgb.Booster) -> 
     alphabetically) would otherwise silently misalign every prediction
     against the wrong feature, with no exception raised."""
     real_by_normalised = {_normalise_feature_name(c): c for c in X.columns}
+    if len(real_by_normalised) < len(X.columns):
+        raise RuntimeError(
+            "Two or more feature columns normalise to the same name (case/punctuation "
+            "collision, e.g. 'Age' and 'age') - the booster-feature reindex can only map "
+            "one real column per normalised key, so proceeding would silently misalign "
+            "or drop a feature with no exception, the same class of bug ADR-009 fixed. "
+            f"Columns: {list(X.columns)}"
+        )
     ordered_columns = [real_by_normalised[_normalise_feature_name(fn)] for fn in booster.feature_name()]
     return X[ordered_columns]
 
@@ -306,26 +314,58 @@ async def _run_baseline_async(
             final_text = "".join(part.text or "" for part in event.content.parts)
 
     execution: ExecutionResult | None = capture.get("result")
-    if execution is None:
-        raise RuntimeError("Agent finished without calling run_training_code.")
+    run_id = uuid.uuid4().hex[:12]
 
-    report = build_run_report_from_execution(
-        execution=execution,
-        generated_code=capture.get("code", ""),
-        run_id=uuid.uuid4().hex[:12],
-        dataset_name=dataset_name,
-        target_column=target_column,
-        train_rows=len(train_df),
-        holdout=holdout,
-        positive_class=positive_class,
-        negative_class=negative_class,
-        duration_seconds=time.monotonic() - started,
-        model_name=model if isinstance(model, str) else model.model,
-        attempts=capture.get("attempts", 0),
-        agent_summary=final_text,
-        modeller_prompt_tokens=modeller_prompt_tokens,
-        modeller_completion_tokens=modeller_completion_tokens,
-    )
+    try:
+        if execution is None:
+            raise RuntimeError("Agent finished without calling run_training_code.")
+
+        report = build_run_report_from_execution(
+            execution=execution,
+            generated_code=capture.get("code", ""),
+            run_id=run_id,
+            dataset_name=dataset_name,
+            target_column=target_column,
+            train_rows=len(train_df),
+            holdout=holdout,
+            positive_class=positive_class,
+            negative_class=negative_class,
+            duration_seconds=time.monotonic() - started,
+            model_name=model if isinstance(model, str) else model.model,
+            attempts=capture.get("attempts", 0),
+            agent_summary=final_text,
+            modeller_prompt_tokens=modeller_prompt_tokens,
+            modeller_completion_tokens=modeller_completion_tokens,
+        )
+    except Exception as exc:
+        # A permanently failed run (non-zero returncode, missing model.txt, or
+        # the agent never calling the tool at all) must still leave a JSON
+        # record behind - otherwise this failure mode leaves no trace, unlike
+        # every successful run (see ADR-008's repeated early_stopping_rounds
+        # crashes, which left nothing to inspect afterwards).
+        failure_report = RunReport(
+            run_id=run_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            dataset_name=dataset_name,
+            target_column=target_column,
+            train_rows=len(train_df),
+            holdout_rows=len(holdout),
+            agent_summary=final_text,
+            generated_code=capture.get("code", ""),
+            stdout=execution.stdout[-4000:] if execution is not None else "",
+            holdout_accuracy=0.0,
+            classification_report={},
+            duration_seconds=time.monotonic() - started,
+            positive_class=positive_class,
+            model=model if isinstance(model, str) else model.model,
+            attempts=capture.get("attempts", 0),
+            modeller_prompt_tokens=modeller_prompt_tokens,
+            modeller_completion_tokens=modeller_completion_tokens,
+            failed=True,
+            failure_reason=str(exc),
+        )
+        save_run(failure_report)
+        raise
 
     if run_critic:
         static_findings = run_static_checks(

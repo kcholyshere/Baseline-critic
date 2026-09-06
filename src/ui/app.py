@@ -11,6 +11,7 @@ classification only.
 """
 
 import asyncio
+from typing import Callable
 
 import pandas as pd
 import streamlit as st
@@ -18,7 +19,7 @@ import streamlit as st
 from src import config, dataset, evaluation
 from src.agent import rescore_run_async, run_baseline, run_baseline_for
 from src.profiling import profile_dataframe
-from src.report import RunReport, list_runs, save_rescoring
+from src.report import RunReport, list_rescorings, list_runs, save_rescoring
 
 st.set_page_config(
     page_title="Baseline critic",
@@ -80,6 +81,21 @@ def _run_label(report: RunReport) -> str:
     return f"{report.timestamp[:19].replace('T', ' ')}  ·  acc {report.holdout_accuracy:.3f}"
 
 
+def _run_and_display(run_fn: Callable[[], RunReport], spinner_text: str) -> None:
+    """Shared scaffolding for both "Run baseline" buttons: spinner, call,
+    stash the new run as selected, toast, rerun - or surface the error the
+    same way if the run fails. Kept in one place so the demo-dataset and
+    upload-CSV handlers can't drift into slightly different behaviour."""
+    try:
+        with st.spinner(spinner_text, show_time=True):
+            new_report = run_fn()
+        st.session_state["selected_run_id"] = new_report.run_id
+        st.toast("Run complete", icon=":material/check_circle:")
+        st.rerun()
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+        st.error(f"Run failed: {exc}", icon=":material/error:")
+
+
 def _render_report(report: RunReport) -> None:
     with st.container(horizontal=True):
         st.metric("Holdout accuracy", f"{report.holdout_accuracy:.1%}", border=True)
@@ -118,6 +134,10 @@ def _render_report(report: RunReport) -> None:
                     st.session_state[f"rescore_result_{report.run_id}"] = new_critique.to_dict()
 
         rescore_result = st.session_state.get(f"rescore_result_{report.run_id}")
+        if rescore_result is None:
+            past_rescorings = list_rescorings(report.run_id)
+            if past_rescorings:
+                rescore_result = past_rescorings[0]["critique"]
         if rescore_result is not None:
             with st.expander("Latest re-score result", icon=":material/history:", expanded=True):
                 st.caption(
@@ -278,14 +298,7 @@ with st.sidebar:
     if mode == "Demo dataset":
         st.caption("Breast Cancer Wisconsin, target: diagnosis")
         if st.button("Run baseline", icon=":material/play_arrow:", type="primary", key="run_button"):
-            try:
-                with st.spinner("Agent is writing and training a baseline...", show_time=True):
-                    new_report = run_baseline()
-                st.session_state["selected_run_id"] = new_report.run_id
-                st.toast("Run complete", icon=":material/check_circle:")
-                st.rerun()
-            except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
-                st.error(f"Run failed: {exc}", icon=":material/error:")
+            _run_and_display(run_baseline, "Agent is writing and training a baseline...")
 
     else:
         st.caption("Binary classification only for this version.")
@@ -312,24 +325,19 @@ with st.sidebar:
                 if st.button(
                     "Run baseline", icon=":material/play_arrow:", type="primary", key="run_button_upload"
                 ):
-                    try:
-                        with st.spinner("Agent is writing and training a baseline...", show_time=True):
-                            uploaded = dataset.prepare_uploaded_dataset(
-                                upload_df, upload_target_column, upload_file_name
-                            )
-                            new_report = run_baseline_for(
-                                train_path=uploaded.train_path,
-                                target_column=upload_target_column,
-                                positive_class=upload_positive_class,
-                                negative_class=upload_negative_class,
-                                holdout=uploaded.holdout,
-                                dataset_name=uploaded.dataset_name,
-                            )
-                        st.session_state["selected_run_id"] = new_report.run_id
-                        st.toast("Run complete", icon=":material/check_circle:")
-                        st.rerun()
-                    except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
-                        st.error(f"Run failed: {exc}", icon=":material/error:")
+
+                    def _run_uploaded() -> RunReport:
+                        uploaded = dataset.prepare_uploaded_dataset(upload_df, upload_target_column, upload_file_name)
+                        return run_baseline_for(
+                            train_path=uploaded.train_path,
+                            target_column=upload_target_column,
+                            positive_class=upload_positive_class,
+                            negative_class=upload_negative_class,
+                            holdout=uploaded.holdout,
+                            dataset_name=uploaded.dataset_name,
+                        )
+
+                    _run_and_display(_run_uploaded, "Agent is writing and training a baseline...")
 
     st.divider()
     st.subheader("Runs")
