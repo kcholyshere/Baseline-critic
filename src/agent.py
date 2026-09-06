@@ -135,14 +135,28 @@ Write a new script that fixes this specific problem rather than repeating it.
 """
         else:
             prior_summaries_text = "\n".join(f"- {s}" for s in revision_context.prior_summaries)
+            task_specific_idea = (
+                "- Try a log or square-root transform of the target if its distribution looks skewed."
+                if is_regression
+                else "- Re-check the imbalance correction (class_weight, scale_pos_weight, or is_unbalance) "
+                "if the profile flagged imbalance and it isn't already set."
+            )
             revision_block = f"""
 You already have an accepted baseline scoring {revision_context.previous_accuracy:.4f} holdout {metric_label}.
 Prior attempts so far:
 {prior_summaries_text}
 
-If you believe a genuinely different feature approach could improve on this
-score, try it. If you cannot think of a meaningfully different approach, it
-is fine to resubmit a similar one.
+Try a genuinely different approach this round rather than resubmitting the
+same features, split, and hyperparameters under different variable names or
+code structure - that wastes a round without changing the result. Pick at
+least one concrete change you have not already tried:
+- Add a feature interaction (e.g. the product or ratio of two existing numeric columns).
+- Tune a LightGBM hyperparameter you have not yet varied: learning_rate, num_leaves,
+  min_child_samples, or num_boost_round.
+- Drop a feature that looks weak or noisy, based on the profile above.
+{task_specific_idea}
+Only resubmit an unchanged approach if you have genuinely already tried
+several of the above across your prior attempts and none of them helped.
 """
     if is_regression:
         task_description = "a tabular regression task"
