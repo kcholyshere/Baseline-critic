@@ -63,6 +63,7 @@ async def run_feature_loop_async(
     dataset_name: str,
     model: str | LiteLlm,
     max_rounds: int = MAX_REVISION_ROUNDS,
+    time_column: str | None = None,
 ) -> LoopResult:
     loop_id = uuid.uuid4().hex[:12]
     attempts: list[RunReport] = []
@@ -100,6 +101,7 @@ async def run_feature_loop_async(
                 round_index=round_index,
                 revised_from_run_id=last_successful.run_id if last_successful is not None else None,
                 revision_context=revision_context,
+                time_column=time_column,
             )
         except Exception:
             # _run_baseline_async has already saved its own failure RunReport
@@ -153,6 +155,7 @@ def run_feature_loop_for(
     dataset_name: str,
     model: str | LiteLlm | None = None,
     max_rounds: int = MAX_REVISION_ROUNDS,
+    time_column: str | None = None,
 ) -> LoopResult:
     """Runs one full feature-proposal loop against an uploaded dataset (see
     dataset.prepare_uploaded_dataset)."""
@@ -166,6 +169,7 @@ def run_feature_loop_for(
             dataset_name=dataset_name,
             model=_resolve_model(model),
             max_rounds=max_rounds,
+            time_column=time_column,
         )
     )
 

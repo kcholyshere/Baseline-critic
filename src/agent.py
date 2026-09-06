@@ -331,12 +331,13 @@ async def _run_baseline_async(
     round_index: int = 0,
     revised_from_run_id: str | None = None,
     revision_context: RevisionContext | None = None,
+    time_column: str | None = None,
 ) -> RunReport:
     started = time.monotonic()
 
     train_df = pd.read_csv(train_path)
     dataset_id = hashlib.sha256(train_path.read_bytes()).hexdigest()[:12]
-    profile = profile_dataframe(train_df, target_column)
+    profile = profile_dataframe(train_df, target_column, time_column)
     profile_text = format_profile_for_prompt(profile)
 
     capture: dict = {}
@@ -400,6 +401,7 @@ async def _run_baseline_async(
         report.loop_id = loop_id
         report.round_index = round_index
         report.revised_from_run_id = revised_from_run_id
+        report.time_column = time_column or ""
     except Exception as exc:
         # A permanently failed run (non-zero returncode, missing model.txt, or
         # the agent never calling the tool at all) must still leave a JSON
@@ -431,6 +433,7 @@ async def _run_baseline_async(
         failure_report.loop_id = loop_id
         failure_report.round_index = round_index
         failure_report.revised_from_run_id = revised_from_run_id
+        failure_report.time_column = time_column or ""
         save_run(failure_report)
         raise
 
@@ -442,6 +445,7 @@ async def _run_baseline_async(
             report.stdout,
             report.holdout_accuracy,
             profile["target"]["is_imbalanced"],
+            time_column,
         )
         critique = await critique_run_async(report, profile_text, static_findings, model)
         report.critique = critique.to_dict()
@@ -464,7 +468,8 @@ async def rescore_run_async(
     never overwritten, so past and re-scored verdicts stay comparable.
     """
     train_df = pd.read_csv(train_path)
-    profile = profile_dataframe(train_df, report.target_column)
+    time_column = report.time_column or None
+    profile = profile_dataframe(train_df, report.target_column, time_column)
     profile_text = format_profile_for_prompt(profile)
     static_findings = run_checks(
         report.generated_code,
@@ -473,6 +478,7 @@ async def rescore_run_async(
         report.stdout,
         report.holdout_accuracy,
         profile["target"]["is_imbalanced"],
+        time_column,
     )
     return await critique_run_async(report, profile_text, static_findings, _resolve_model(model))
 
@@ -522,6 +528,7 @@ def run_baseline_for(
     inject_signature: bool = True,
     allow_retry: bool = True,
     run_critic: bool = True,
+    time_column: str | None = None,
 ) -> RunReport:
     """Runs one full baseline cycle against an uploaded dataset (see dataset.prepare_uploaded_dataset)."""
     return asyncio.run(
@@ -537,6 +544,7 @@ def run_baseline_for(
             inject_signature=inject_signature,
             allow_retry=allow_retry,
             run_critic=run_critic,
+            time_column=time_column,
         )
     )
 

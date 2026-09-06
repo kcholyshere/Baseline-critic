@@ -72,6 +72,7 @@ class RunReport:
     loop_id: str | None = None
     round_index: int = 0
     revised_from_run_id: str | None = None
+    time_column: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

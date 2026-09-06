@@ -18,9 +18,12 @@ defect_category it is evidence for. src/critic.py's reject-gate (ADR-016)
 reads each StaticFinding's category to refuse an LLM reject verdict that
 names a category none of these checks actually found - closing the general
 hallucination class (a reject with no static backing at all) rather than
-patching one hallucinated pattern at a time. temporal_leakage is
-deliberately untagged by any check (ADR-014's threshold search failed) and
-stays exempt from that gate, not silently caught by it.
+patching one hallucinated pattern at a time. temporal_leakage stays exempt
+from that gate by design even though _check_shuffled_time_series_split now
+tags it: that check only catches a shuffled internal split on an explicitly
+time-ordered dataset, not the general case (e.g. a leaked global aggregate
+encoding, ADR-014's original threshold search), so gating on it would risk
+blocking a genuine LLM-only reject of the case it can't see.
 
 Callers get the findings from one call to run_checks() and derive display
 text and evidence categories from that same list themselves, rather than
@@ -68,13 +71,46 @@ def _check_column_order_instability(code: str) -> StaticFinding | None:
     return None
 
 
-def _check_missing_stratify(code: str) -> StaticFinding | None:
+def _check_missing_stratify(code: str, time_column: str | None) -> StaticFinding | None:
+    """Silent whenever time_column is set: scikit-learn's train_test_split
+    itself refuses stratify= together with shuffle=False, so a time-ordered
+    dataset legitimately has no stratify= call - flagging its absence there
+    would tell the critic the opposite of what _check_shuffled_time_series_split
+    already tells it, the same kind of contradiction ADR-015 found confusing
+    the critic into ignoring a real finding."""
+    if time_column is not None:
+        return None
     if "train_test_split(" in code and "stratify" not in code:
         return StaticFinding(
             "train_test_split() is used without stratify= - risks a degenerate internal validation split on an imbalanced target.",
             category="degenerate_split",
         )
     return None
+
+
+def _check_shuffled_time_series_split(code: str, time_column: str | None) -> StaticFinding | None:
+    """Flags a time-ordered dataset's internal train_test_split call that
+    doesn't disable shuffling - the concrete, checkable instantiation of
+    temporal_leakage this project can actually detect (ADR-014 found no safe
+    correlation threshold for the general case, e.g. a leaked global
+    aggregate encoding, which this check does not attempt).
+
+    category="temporal_leakage" so a genuine hit shows up in
+    evidence_categories (helps src/critic.py's fallback verdict pick a
+    real, evidenced category) - but temporal_leakage stays in
+    src/critic.py's UNGATED_CATEGORIES regardless, since gating it on this
+    one narrow pattern would risk blocking a genuine LLM-only reject of the
+    encoding-based flavour this check can't see."""
+    if time_column is None or "train_test_split(" not in code:
+        return None
+    if re.search(r"shuffle\s*=\s*False", code):
+        return None
+    return StaticFinding(
+        f"Dataset is time-ordered by '{time_column}', but the script's train_test_split() call does "
+        "not set shuffle=False - a random internal split on time-ordered data lets future rows leak "
+        "into validation, the classic temporal-leakage pattern.",
+        category="temporal_leakage",
+    )
 
 
 def _check_missing_imbalance_correction(code: str, is_imbalanced: bool) -> StaticFinding | None:
@@ -292,6 +328,7 @@ def _run_all_checks(
     stdout: str,
     holdout_accuracy: float,
     is_imbalanced: bool,
+    time_column: str | None,
 ) -> list[StaticFinding]:
     """Runs every static check once and returns the findings that fired -
     shared by run_static_checks (display text) and evidence_categories
@@ -299,9 +336,10 @@ def _run_all_checks(
     scored_on_training_rows_finding = _check_scored_on_training_rows(generated_code)
     checks = [
         _check_column_order_instability(generated_code),
-        _check_missing_stratify(generated_code),
+        _check_missing_stratify(generated_code, time_column),
         _check_missing_seed(generated_code),
         _check_missing_imbalance_correction(generated_code, is_imbalanced),
+        _check_shuffled_time_series_split(generated_code, time_column),
         _check_foreign_file_path(generated_code, train_path),
         _check_public_dataset_import(generated_code),
         _check_target_column_referenced(generated_code, target_column),
@@ -320,10 +358,13 @@ def run_checks(
     stdout: str,
     holdout_accuracy: float,
     is_imbalanced: bool = False,
+    time_column: str | None = None,
 ) -> list[StaticFinding]:
     """Runs every static check once and returns the raw findings. Callers
     that need display text, evidence categories, or both (src/critic.py's
     reject-gate, src/agent.py, src/evaluation.py) should derive them from
     this one list rather than calling separate functions that would each
     re-run every check independently."""
-    return _run_all_checks(generated_code, train_path, target_column, stdout, holdout_accuracy, is_imbalanced)
+    return _run_all_checks(
+        generated_code, train_path, target_column, stdout, holdout_accuracy, is_imbalanced, time_column
+    )

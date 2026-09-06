@@ -35,14 +35,20 @@ def _load_source() -> pd.DataFrame:
     return df.drop(columns=["target"])
 
 
-def _split_indices(df: pd.DataFrame, target_column: str) -> tuple[pd.Index, pd.Index]:
-    train_idx, holdout_idx = train_test_split(
-        df.index,
-        test_size=HOLDOUT_FRACTION,
-        random_state=SEED,
-        stratify=df[target_column],
-    )
+def _time_sort_key(series: pd.Series) -> pd.Series:
+    """Orders a time column chronologically. Tries datetime parsing first
+    (covers real dates/timestamps); falls back to the column's own values
+    for an already-numeric time proxy (e.g. a period index) that
+    pd.to_datetime can't parse. profiling.detect_candidate_time_columns
+    already restricts the choices a caller can pass here to columns that
+    parse cleanly one way or the other, so this never needs to raise."""
+    try:
+        return pd.to_datetime(series)
+    except (ValueError, TypeError):
+        return series
 
+
+def _validate_split_classes(df: pd.DataFrame, target_column: str, train_idx: pd.Index, holdout_idx: pd.Index) -> None:
     all_classes = set(df[target_column].dropna().unique())
     train_classes = set(df.loc[train_idx, target_column].dropna().unique())
     holdout_classes = set(df.loc[holdout_idx, target_column].dropna().unique())
@@ -63,6 +69,29 @@ def _split_indices(df: pd.DataFrame, target_column: str) -> tuple[pd.Index, pd.I
             + ". Add more rows for the affected class, or use a larger holdout fraction."
         )
 
+
+def _split_indices(df: pd.DataFrame, target_column: str, time_column: str | None = None) -> tuple[pd.Index, pd.Index]:
+    if time_column is not None:
+        # Chronological split, not random: the earliest rows train, the
+        # latest rows are held out - the shape a real deployment sees
+        # (predicting the future from the past), and the basis the new
+        # shuffled-split check in checks.py assumes when it tells the
+        # modeller not to re-shuffle. No stratify here - sklearn's
+        # train_test_split itself refuses stratify without shuffling, and
+        # the same reasoning applies: a chronological split's class balance
+        # is whatever the timeline actually contains, not a chosen ratio.
+        ordered_idx = df.index[_time_sort_key(df[time_column]).to_numpy().argsort(kind="stable")]
+        split_point = round(len(ordered_idx) * (1 - HOLDOUT_FRACTION))
+        train_idx, holdout_idx = ordered_idx[:split_point], ordered_idx[split_point:]
+    else:
+        train_idx, holdout_idx = train_test_split(
+            df.index,
+            test_size=HOLDOUT_FRACTION,
+            random_state=SEED,
+            stratify=df[target_column],
+        )
+
+    _validate_split_classes(df, target_column, train_idx, holdout_idx)
     return train_idx, holdout_idx
 
 
@@ -110,16 +139,22 @@ class UploadedDataset:
     holdout: pd.DataFrame
     target_column: str
     dataset_name: str
+    time_column: str | None = None
 
 
-def prepare_uploaded_dataset(df: pd.DataFrame, target_column: str, dataset_name: str) -> UploadedDataset:
+def prepare_uploaded_dataset(
+    df: pd.DataFrame, target_column: str, dataset_name: str, time_column: str | None = None
+) -> UploadedDataset:
     """Splits an uploaded dataset and writes only the train rows to disk.
 
     The holdout is returned in memory and never persisted - see this
     module's docstring. Call validate_binary_target first; this function
-    assumes the target column is already known-good.
+    assumes the target column is already known-good. time_column, if given,
+    must be one of profiling.detect_candidate_time_columns(df, target_column)
+    - this function trusts it's already known-parseable, the same way it
+    trusts target_column is already known-good, rather than re-validating.
     """
-    train_idx, holdout_idx = _split_indices(df, target_column)
+    train_idx, holdout_idx = _split_indices(df, target_column, time_column)
     train_df = df.loc[train_idx].reset_index(drop=True)
     holdout_df = df.loc[holdout_idx].reset_index(drop=True)
 
@@ -133,6 +168,7 @@ def prepare_uploaded_dataset(df: pd.DataFrame, target_column: str, dataset_name:
         holdout=holdout_df,
         target_column=target_column,
         dataset_name=dataset_name,
+        time_column=time_column,
     )
 
 

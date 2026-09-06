@@ -25,7 +25,7 @@ from src.feature_loop import (
     run_feature_loop_for,
     select_loop_winner,
 )
-from src.profiling import profile_dataframe
+from src.profiling import detect_candidate_time_columns, profile_dataframe
 from src.report import RunReport, list_loop_attempts, list_rescorings, list_runs, save_rescoring
 
 st.set_page_config(
@@ -403,14 +403,31 @@ with st.sidebar:
                     key="upload_positive_class",
                 )
                 upload_negative_class = next(c for c in classes if c != upload_positive_class)
-                upload_profile = profile_dataframe(upload_df, upload_target_column)
+
+                candidate_time_columns = detect_candidate_time_columns(upload_df, upload_target_column)
+                upload_time_column: str | None = None
+                if candidate_time_columns:
+                    time_choice = st.selectbox(
+                        "Time column (optional - enables a chronological train/holdout split)",
+                        options=["None"] + candidate_time_columns,
+                        key="upload_time_column",
+                        help="When set, training data is the earliest rows and the holdout is the "
+                        "latest rows by this column, instead of a random split - the shape a real "
+                        "deployment sees, and it lets the critic check for a shuffled internal "
+                        "validation split (temporal leakage).",
+                    )
+                    upload_time_column = None if time_choice == "None" else time_choice
+
+                upload_profile = profile_dataframe(upload_df, upload_target_column, upload_time_column)
 
                 if st.button(
                     "Run baseline", icon=":material/play_arrow:", type="primary", key="run_button_upload"
                 ):
 
                     def _run_uploaded() -> RunReport:
-                        uploaded = dataset.prepare_uploaded_dataset(upload_df, upload_target_column, upload_file_name)
+                        uploaded = dataset.prepare_uploaded_dataset(
+                            upload_df, upload_target_column, upload_file_name, upload_time_column
+                        )
                         return run_baseline_for(
                             train_path=uploaded.train_path,
                             target_column=upload_target_column,
@@ -418,6 +435,7 @@ with st.sidebar:
                             negative_class=upload_negative_class,
                             holdout=uploaded.holdout,
                             dataset_name=uploaded.dataset_name,
+                            time_column=uploaded.time_column,
                         )
 
                     _run_and_display(_run_uploaded, "Agent is writing and training a baseline...")
@@ -425,7 +443,9 @@ with st.sidebar:
                 if st.button("Run feature loop", icon=":material/loop:", key="run_loop_button_upload"):
 
                     def _run_uploaded_loop() -> LoopResult:
-                        uploaded = dataset.prepare_uploaded_dataset(upload_df, upload_target_column, upload_file_name)
+                        uploaded = dataset.prepare_uploaded_dataset(
+                            upload_df, upload_target_column, upload_file_name, upload_time_column
+                        )
                         return run_feature_loop_for(
                             train_path=uploaded.train_path,
                             target_column=upload_target_column,
@@ -434,6 +454,7 @@ with st.sidebar:
                             holdout=uploaded.holdout,
                             dataset_name=uploaded.dataset_name,
                             max_rounds=max_rounds,
+                            time_column=uploaded.time_column,
                         )
 
                     _run_loop_and_display(_run_uploaded_loop, loop_spinner_text)
@@ -535,6 +556,11 @@ with tab_run:
                 f"{upload_profile['row_count']} rows, {len(upload_profile['features'])} feature columns. "
                 f"Target '{upload_target_column}' balance: {upload_profile['target']['value_counts']}"
             )
+            if upload_profile["time_column"]:
+                st.caption(
+                    f":material/schedule: Chronological split active on '{upload_profile['time_column']}' - "
+                    "training data is the earliest rows, the holdout is the latest rows."
+                )
             st.dataframe(_profile_df(upload_profile), width="stretch")
         st.divider()
 
