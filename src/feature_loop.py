@@ -21,12 +21,16 @@ from src.agent import RevisionContext, _resolve_model, _run_baseline_async
 from src.report import RunReport
 
 # Bounded the same way agent.py's MAX_TRAINING_ATTEMPTS and critic.py's
-# MAX_CRITIQUE_ROUNDS are: a code-enforced ceiling, not a request. 3 rounds
-# at up to MAX_TRAINING_ATTEMPTS=3 sandbox calls each is 9 calls per loop
+# MAX_CRITIQUE_ROUNDS are: a code-enforced ceiling, not a request. 5 rounds
+# at up to MAX_TRAINING_ATTEMPTS=3 sandbox calls each is 15 calls per loop
 # invocation against code_execution.MAX_CALLS_PER_SESSION=60 - comfortably
 # leaves room for several loop invocations (or a loop plus standalone runs)
 # within one process's lifetime, per the reasoning bumping that budget.
-MAX_REVISION_ROUNDS = 3
+# Raised from 3 to 5 (2026-09-06) after live use showed the local model
+# sometimes burns a round or two failing to call the training tool at all
+# (references/local-model-benchmarks.md) - more rounds gives the loop a
+# realistic chance to still get a few genuine feature-iteration attempts in.
+MAX_REVISION_ROUNDS = 5
 
 
 @dataclass

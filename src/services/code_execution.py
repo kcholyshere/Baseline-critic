@@ -17,11 +17,11 @@ TIMEOUT_SECONDS = 120
 # A module-level global, not a per-Streamlit-browser-session counter - it
 # never resets, so it bounds this whole process's lifetime, not one UI
 # session. One feature-proposal-loop invocation (src/feature_loop.py) can
-# itself cost up to MAX_REVISION_ROUNDS x MAX_TRAINING_ATTEMPTS = 3 x 3 = 9
-# sandbox calls, so the old ceiling of 20 let the process survive barely two
-# loop invocations before erroring - unusable as a demo. 60 gives headroom
-# for several loop invocations plus standalone single-shot runs within one
-# process lifetime.
+# itself cost up to MAX_REVISION_ROUNDS x MAX_TRAINING_ATTEMPTS = 5 x 3 = 15
+# sandbox calls (raised from 3 rounds/9 calls on 2026-09-06), so the old
+# ceiling of 20 let the process survive barely two loop invocations before
+# erroring - unusable as a demo. 60 gives headroom for several loop
+# invocations plus standalone single-shot runs within one process lifetime.
 MAX_CALLS_PER_SESSION = 60
 MAX_ARTIFACT_BYTES = 50 * 1024 * 1024  # 50 MB per artifact file
 
