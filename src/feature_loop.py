@@ -64,6 +64,7 @@ async def run_feature_loop_async(
     model: str | LiteLlm,
     max_rounds: int = MAX_REVISION_ROUNDS,
     time_column: str | None = None,
+    task_type: str = "classification",
 ) -> LoopResult:
     loop_id = uuid.uuid4().hex[:12]
     attempts: list[RunReport] = []
@@ -102,6 +103,7 @@ async def run_feature_loop_async(
                 revised_from_run_id=last_successful.run_id if last_successful is not None else None,
                 revision_context=revision_context,
                 time_column=time_column,
+                task_type=task_type,
             )
         except Exception:
             # _run_baseline_async has already saved its own failure RunReport
@@ -118,8 +120,9 @@ async def run_feature_loop_async(
         # in a later round's "Prior attempts so far" prompt text (audit
         # finding #7).
         critique = report.critique
+        metric_label = "r2" if report.task_type == "regression" else "acc"
         if critique["verdict"] == "accept":
-            tag = f"[accepted, acc={report.holdout_accuracy:.4f}]"
+            tag = f"[accepted, {metric_label}={report.holdout_accuracy:.4f}]"
         else:
             tag = f"[rejected: {critique['defect_category']}]"
         prior_summaries.append(f"{tag} {report.agent_summary}")
@@ -142,6 +145,7 @@ def run_feature_loop(model: str | LiteLlm | None = None, max_rounds: int = MAX_R
             dataset_name="breast_cancer_wisconsin",
             model=_resolve_model(model),
             max_rounds=max_rounds,
+            task_type="classification",
         )
     )
 
@@ -156,6 +160,7 @@ def run_feature_loop_for(
     model: str | LiteLlm | None = None,
     max_rounds: int = MAX_REVISION_ROUNDS,
     time_column: str | None = None,
+    task_type: str = "classification",
 ) -> LoopResult:
     """Runs one full feature-proposal loop against an uploaded dataset (see
     dataset.prepare_uploaded_dataset)."""
@@ -170,6 +175,7 @@ def run_feature_loop_for(
             model=_resolve_model(model),
             max_rounds=max_rounds,
             time_column=time_column,
+            task_type=task_type,
         )
     )
 

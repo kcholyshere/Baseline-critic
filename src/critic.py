@@ -97,7 +97,19 @@ def _build_critic_instruction(report: RunReport, profile_text: str, static_findi
     generated_code = report.generated_code
     stdout = report.stdout
     agent_summary = report.agent_summary
-    classification_report_json = json.dumps(report.classification_report)
+    if report.task_type == "regression":
+        metrics = report.regression_metrics
+        results_block = (
+            f"Reported holdout R²: {metrics.get('r2', report.holdout_accuracy):.4f}\n"
+            f"Reported holdout RMSE: {metrics.get('rmse', float('nan')):.4f}\n"
+            f"Reported holdout MAE: {metrics.get('mae', float('nan')):.4f}"
+        )
+    else:
+        classification_report_json = json.dumps(report.classification_report)
+        results_block = (
+            f"Reported holdout accuracy: {report.holdout_accuracy:.4f}\n"
+            f"Classification report: {classification_report_json}"
+        )
     return f"""\
 You are the critic in a baseline modelling pipeline. A separate agent wrote
 and ran a training script; your only job is to decide whether its reported
@@ -128,8 +140,7 @@ The script's own stdout:
 The agent's one-sentence summary of what it did:
 {agent_summary}
 
-Reported holdout accuracy: {report.holdout_accuracy:.4f}
-Classification report: {classification_report_json}
+{results_block}
 
 Look specifically for: leakage, train/test contamination, a target column
 smuggled into the features, temporal leakage, unseeded randomness, and any

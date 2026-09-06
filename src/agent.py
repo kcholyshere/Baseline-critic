@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import lightgbm as lgb
+import numpy as np
 import pandas as pd
 from google.adk.agents import Agent
 from google.adk.models.lite_llm import LiteLlm
@@ -40,7 +41,7 @@ from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
 from google.genai import types as genai_types
 from mcp import StdioServerParameters
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, mean_absolute_error, mean_squared_error, r2_score
 
 from src import config, dataset
 from src.checks import run_checks
@@ -80,7 +81,10 @@ def _build_instruction(
     inject_signature: bool = False,
     allow_retry: bool = False,
     revision_context: RevisionContext | None = None,
+    task_type: str = "classification",
 ) -> str:
+    is_regression = task_type == "regression"
+    metric_label = "R²" if is_regression else "accuracy"
     docs_tool_line = (
         "\nYou also have a get_api_signature tool that returns the real, "
         "currently installed signature and docstring for a pandas, sklearn, "
@@ -132,7 +136,7 @@ Write a new script that fixes this specific problem rather than repeating it.
         else:
             prior_summaries_text = "\n".join(f"- {s}" for s in revision_context.prior_summaries)
             revision_block = f"""
-You already have an accepted baseline scoring {revision_context.previous_accuracy:.4f} holdout accuracy.
+You already have an accepted baseline scoring {revision_context.previous_accuracy:.4f} holdout {metric_label}.
 Prior attempts so far:
 {prior_summaries_text}
 
@@ -140,28 +144,47 @@ If you believe a genuinely different feature approach could improve on this
 score, try it. If you cannot think of a meaningfully different approach, it
 is fine to resubmit a similar one.
 """
+    if is_regression:
+        task_description = "a tabular regression task"
+        label_step = (
+            f'2. Uses the target column "{target_column}" directly as the continuous label - do not '
+            "binarise or otherwise transform it."
+        )
+        train_params = '{"objective": "regression", "metric": "rmse", "verbosity": -1}'
+        excluded_columns = f'the target column "{target_column}"'
+        print_step = "5. Prints its own validation RMSE."
+    else:
+        task_description = "a tabular binary classification task"
+        label_step = (
+            f'2. Builds a binary label column: 1 where the target equals "{positive_class}",\n   else 0.'
+        )
+        train_params = '{"objective": "binary", "metric": "binary_logloss", "verbosity": -1}'
+        excluded_columns = f'the target column "{target_column}" and the label column you added'
+        print_step = "5. Prints its own validation accuracy at a 0.5 probability threshold."
+    positive_class_line = (
+        f'\nYou will be told the path to a training CSV and its target column, which\n'
+        f'holds two string values. The positive class (the outcome of interest) is\n"{positive_class}".'
+        if not is_regression
+        else "\nYou will be told the path to a training CSV and its target column, which holds a continuous "
+        "numeric value."
+    )
     return f"""\
-You are a baseline modelling agent for a tabular binary classification task.
+You are a baseline modelling agent for {task_description}.
 
 Here is a deterministic profile of the dataset, computed with pandas - trust
 these facts over any assumption you might otherwise make about the data:
 
 {profile_text}
-{docs_tool_line}{signature_block}
-You will be told the path to a training CSV and its target column, which
-holds two string values. The positive class (the outcome of interest) is
-"{positive_class}". Write one self-contained Python script that:
+{docs_tool_line}{signature_block}{positive_class_line} Write one self-contained Python script that:
 1. Loads the CSV at the given path with pandas. Do not read, write, or
    reference any other file.
-2. Builds a binary label column: 1 where the target equals "{positive_class}",
-   else 0.
+{label_step}
 3. Splits off its own internal validation slice from that CSV only.
-4. Trains with the low-level `lightgbm.train()` API (not LGBMClassifier) on
-   a `lightgbm.Dataset` built from every column except the target column
-   "{target_column}" and the label column you added - exclude any column the
-   profile above flags as a likely identifier - with params
-   {{"objective": "binary", "metric": "binary_logloss", "verbosity": -1}}.
-5. Prints its own validation accuracy at a 0.5 probability threshold.
+4. Trains with the low-level `lightgbm.train()` API (not LGBMClassifier or
+   LGBMRegressor) on a `lightgbm.Dataset` built from every column except
+   {excluded_columns} - exclude any column the profile above flags as a
+   likely identifier - with params {train_params}.
+{print_step}
 6. Saves the trained booster with `booster.save_model("model.txt")` -
    LightGBM's own text format. Do not use pickle or joblib.
 {revision_block}
@@ -250,12 +273,18 @@ def build_run_report_from_execution(
     agent_summary: str,
     modeller_prompt_tokens: int = 0,
     modeller_completion_tokens: int = 0,
+    task_type: str = "classification",
 ) -> RunReport:
     """Turns a finished sandbox execution into a scored RunReport - the same
     booster-load, feature-reindex, and holdout-scoring steps _run_baseline_async
     uses, factored out so src/evaluation.py's hand-written defect fixtures are
     scored through the identical path a real agent run goes through, rather
     than a second copy that could quietly drift from it.
+
+    holdout_accuracy always holds the headline higher-is-better metric for
+    either task_type - accuracy for classification, R² for regression - so
+    that feature_loop.select_loop_winner's max(..., key=holdout_accuracy)
+    stays correct without needing to know which task type it's comparing.
     """
     if execution.returncode != 0:
         raise RuntimeError(f"Training script failed:\n{execution.stderr}")
@@ -266,9 +295,25 @@ def build_run_report_from_execution(
     booster = lgb.Booster(model_str=model_bytes.decode())
 
     X_holdout = holdout.drop(columns=[target_column])
-    y_holdout = (holdout[target_column] == positive_class).astype(int)
     X_holdout = _reindex_to_booster_feature_order(X_holdout, booster)
-    y_pred = (booster.predict(X_holdout) >= 0.5).astype(int)
+    y_pred_raw = booster.predict(X_holdout)
+
+    if task_type == "regression":
+        y_holdout = holdout[target_column].astype(float)
+        rmse = float(np.sqrt(mean_squared_error(y_holdout, y_pred_raw)))
+        mae = float(mean_absolute_error(y_holdout, y_pred_raw))
+        r2 = float(r2_score(y_holdout, y_pred_raw))
+        holdout_accuracy = r2
+        classification_report_dict: dict = {}
+        regression_metrics = {"rmse": rmse, "mae": mae, "r2": r2}
+    else:
+        y_holdout = (holdout[target_column] == positive_class).astype(int)
+        y_pred = (y_pred_raw >= 0.5).astype(int)
+        holdout_accuracy = accuracy_score(y_holdout, y_pred)
+        classification_report_dict = classification_report(
+            y_holdout, y_pred, target_names=[negative_class, positive_class], output_dict=True
+        )
+        regression_metrics = {}
 
     return RunReport(
         run_id=run_id,
@@ -280,16 +325,16 @@ def build_run_report_from_execution(
         agent_summary=agent_summary,
         generated_code=generated_code,
         stdout=execution.stdout[-4000:],
-        holdout_accuracy=accuracy_score(y_holdout, y_pred),
-        classification_report=classification_report(
-            y_holdout, y_pred, target_names=[negative_class, positive_class], output_dict=True
-        ),
+        holdout_accuracy=holdout_accuracy,
+        classification_report=classification_report_dict,
         duration_seconds=duration_seconds,
         positive_class=positive_class,
         model=model_name,
         attempts=attempts,
         modeller_prompt_tokens=modeller_prompt_tokens,
         modeller_completion_tokens=modeller_completion_tokens,
+        task_type=task_type,
+        regression_metrics=regression_metrics,
     )
 
 
@@ -332,17 +377,25 @@ async def _run_baseline_async(
     revised_from_run_id: str | None = None,
     revision_context: RevisionContext | None = None,
     time_column: str | None = None,
+    task_type: str = "classification",
 ) -> RunReport:
     started = time.monotonic()
 
     train_df = pd.read_csv(train_path)
     dataset_id = hashlib.sha256(train_path.read_bytes()).hexdigest()[:12]
-    profile = profile_dataframe(train_df, target_column, time_column)
+    profile = profile_dataframe(train_df, target_column, time_column, task_type)
     profile_text = format_profile_for_prompt(profile)
 
     capture: dict = {}
     instruction = _build_instruction(
-        target_column, positive_class, profile_text, use_docs_tool, inject_signature, allow_retry, revision_context
+        target_column,
+        positive_class,
+        profile_text,
+        use_docs_tool,
+        inject_signature,
+        allow_retry,
+        revision_context,
+        task_type,
     )
     agent = _build_agent(capture, instruction, model, use_docs_tool, allow_retry)
     runner = InMemoryRunner(agent=agent, app_name=APP_NAME)
@@ -396,6 +449,7 @@ async def _run_baseline_async(
             agent_summary=final_text,
             modeller_prompt_tokens=modeller_prompt_tokens,
             modeller_completion_tokens=modeller_completion_tokens,
+            task_type=task_type,
         )
         report.dataset_id = dataset_id
         report.loop_id = loop_id
@@ -428,6 +482,7 @@ async def _run_baseline_async(
             modeller_completion_tokens=modeller_completion_tokens,
             failed=True,
             failure_reason=str(exc),
+            task_type=task_type,
         )
         failure_report.dataset_id = dataset_id
         failure_report.loop_id = loop_id
@@ -446,6 +501,7 @@ async def _run_baseline_async(
             report.holdout_accuracy,
             profile["target"]["is_imbalanced"],
             time_column,
+            task_type,
         )
         critique = await critique_run_async(report, profile_text, static_findings, model)
         report.critique = critique.to_dict()
@@ -469,7 +525,8 @@ async def rescore_run_async(
     """
     train_df = pd.read_csv(train_path)
     time_column = report.time_column or None
-    profile = profile_dataframe(train_df, report.target_column, time_column)
+    task_type = report.task_type or "classification"
+    profile = profile_dataframe(train_df, report.target_column, time_column, task_type)
     profile_text = format_profile_for_prompt(profile)
     static_findings = run_checks(
         report.generated_code,
@@ -479,6 +536,7 @@ async def rescore_run_async(
         report.holdout_accuracy,
         profile["target"]["is_imbalanced"],
         time_column,
+        task_type,
     )
     return await critique_run_async(report, profile_text, static_findings, _resolve_model(model))
 
@@ -512,6 +570,7 @@ def run_baseline(
             inject_signature=inject_signature,
             allow_retry=allow_retry,
             run_critic=run_critic,
+            task_type="classification",
         )
     )
 
@@ -529,6 +588,7 @@ def run_baseline_for(
     allow_retry: bool = True,
     run_critic: bool = True,
     time_column: str | None = None,
+    task_type: str = "classification",
 ) -> RunReport:
     """Runs one full baseline cycle against an uploaded dataset (see dataset.prepare_uploaded_dataset)."""
     return asyncio.run(
@@ -545,6 +605,7 @@ def run_baseline_for(
             allow_retry=allow_retry,
             run_critic=run_critic,
             time_column=time_column,
+            task_type=task_type,
         )
     )
 

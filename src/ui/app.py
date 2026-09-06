@@ -6,8 +6,9 @@ convention, see that project's src/ui/app.py for why.)
 
 Demo-scoped (2026-08-28): shows one agent's run, past and new, against
 either the built-in Breast Cancer Wisconsin dataset or an uploaded CSV.
-Not the planner/modeller/critic loop the proposal describes. Binary
-classification only.
+Not the planner/modeller/critic loop the proposal describes. The built-in
+demo dataset is always binary classification; an uploaded CSV can be either
+binary classification or regression (auto-detected, overridable).
 """
 
 import asyncio
@@ -69,6 +70,19 @@ def _classification_report_df(report: dict) -> pd.DataFrame:
     return df[["precision", "recall", "f1_score", "support"]].round(3)
 
 
+def _suggest_task_type(df: pd.DataFrame, target_column: str) -> str:
+    """Heuristic default for the task-type picker, not a hard rule - the
+    user can always override. A numeric target with many distinct values
+    looks like a continuous quantity to predict (regression); anything else
+    (strings, or a numeric column with only a handful of distinct values,
+    e.g. an encoded label) defaults to the classification path this project
+    started with."""
+    series = df[target_column].dropna()
+    if pd.api.types.is_numeric_dtype(series) and series.nunique() > 20:
+        return "regression"
+    return "classification"
+
+
 def _profile_df(profile: dict) -> pd.DataFrame:
     rows = []
     for name, stats in profile["features"].items():
@@ -89,7 +103,8 @@ def _run_label(report: RunReport) -> str:
     timestamp = report.timestamp[:19].replace("T", " ")
     if report.failed:
         return f"{timestamp}  ·  failed"
-    base = f"{timestamp}  ·  acc {report.holdout_accuracy:.3f}"
+    metric_label = "R²" if report.task_type == "regression" else "acc"
+    base = f"{timestamp}  ·  {metric_label} {report.holdout_accuracy:.3f}"
     if report.critique is None:
         return base
     if report.critique["verdict"] == "accept":
@@ -146,7 +161,10 @@ def _render_report(report: RunReport) -> None:
         return
 
     with st.container(horizontal=True):
-        st.metric("Holdout accuracy", f"{report.holdout_accuracy:.1%}", border=True)
+        if report.task_type == "regression":
+            st.metric("Holdout R²", f"{report.holdout_accuracy:.3f}", border=True)
+        else:
+            st.metric("Holdout accuracy", f"{report.holdout_accuracy:.1%}", border=True)
         st.metric("Train rows", report.train_rows, border=True)
         st.metric("Holdout rows", report.holdout_rows, border=True)
         st.metric("Run time", f"{report.duration_seconds:.1f}s", border=True)
@@ -203,17 +221,25 @@ def _render_report(report: RunReport) -> None:
     col_report, col_meta = st.columns([3, 2])
     with col_report:
         with st.container(border=True):
-            st.subheader("Classification report")
-            st.dataframe(
-                _classification_report_df(report.classification_report),
-                width="stretch",
-                column_config={
-                    "precision": st.column_config.NumberColumn(format="%.3f"),
-                    "recall": st.column_config.NumberColumn(format="%.3f"),
-                    "f1_score": st.column_config.NumberColumn("F1 score", format="%.3f"),
-                    "support": st.column_config.NumberColumn(width="small"),
-                },
-            )
+            if report.task_type == "regression":
+                st.subheader("Regression metrics")
+                metrics = report.regression_metrics
+                with st.container(horizontal=True):
+                    st.metric("RMSE", f"{metrics.get('rmse', float('nan')):.4f}", border=True)
+                    st.metric("MAE", f"{metrics.get('mae', float('nan')):.4f}", border=True)
+                    st.metric("R²", f"{metrics.get('r2', report.holdout_accuracy):.4f}", border=True)
+            else:
+                st.subheader("Classification report")
+                st.dataframe(
+                    _classification_report_df(report.classification_report),
+                    width="stretch",
+                    column_config={
+                        "precision": st.column_config.NumberColumn(format="%.3f"),
+                        "recall": st.column_config.NumberColumn(format="%.3f"),
+                        "f1_score": st.column_config.NumberColumn("F1 score", format="%.3f"),
+                        "support": st.column_config.NumberColumn(width="small"),
+                    },
+                )
     with col_meta:
         with st.container(border=True):
             st.subheader("Run")
@@ -245,9 +271,15 @@ def _render_report(report: RunReport) -> None:
 
 def _render_loop_result(loop_result: LoopResult) -> None:
     if loop_result.winner is not None:
+        winner_metric_label = "Winner holdout R²" if loop_result.winner.task_type == "regression" else "Winner holdout accuracy"
+        winner_metric_value = (
+            f"{loop_result.winner.holdout_accuracy:.3f}"
+            if loop_result.winner.task_type == "regression"
+            else f"{loop_result.winner.holdout_accuracy:.1%}"
+        )
         with st.container(horizontal=True, vertical_alignment="center"):
             st.badge("Winner found", icon=":material/emoji_events:", color="green")
-            st.metric("Winner holdout accuracy", f"{loop_result.winner.holdout_accuracy:.1%}", border=True)
+            st.metric(winner_metric_label, winner_metric_value, border=True)
             st.metric("Winning round", loop_result.winner.round_index, border=True)
             st.metric("Rounds run", len(loop_result.attempts), border=True)
     else:
@@ -316,6 +348,7 @@ def _render_evaluation_tab() -> None:
 
     rows = [
         {
+            "task type": row.get("task_type", "classification"),
             "category": row["defect_category"],
             "ground truth": row["ground_truth_verdict"],
             "static check fired": "yes" if row.get("static_evidence_categories") else "no",
@@ -326,7 +359,10 @@ def _render_evaluation_tab() -> None:
         for row in summary["categories"]
     ]
     st.dataframe(
-        pd.DataFrame(rows).set_index("category"),
+        # Category names repeat across task-type tracks (e.g. "target_leakage"
+        # exists for both classification and regression fixtures) - index on
+        # both columns so the two tracks' rows stay distinguishable.
+        pd.DataFrame(rows).set_index(["task type", "category"]),
         width="stretch",
         column_config={
             "LLM-only reject rate": st.column_config.NumberColumn(format="%.2f"),
@@ -341,7 +377,10 @@ def _render_evaluation_tab() -> None:
 
     with st.expander("Fixture descriptions"):
         for row in summary["categories"]:
-            st.markdown(f"**{row['defect_category']}** ({row['ground_truth_verdict']}): {row['description']}")
+            task_type_label = row.get("task_type", "classification")
+            st.markdown(
+                f"**{task_type_label}/{row['defect_category']}** ({row['ground_truth_verdict']}): {row['description']}"
+            )
 
     clean_row = next((r for r in summary["categories"] if r["ground_truth_verdict"] == "accept"), None)
     if clean_row and clean_row["rejecting_trials"]:
@@ -368,6 +407,7 @@ st.html("""
 upload_df: pd.DataFrame | None = None
 upload_file_name: str | None = None
 upload_target_column: str | None = None
+upload_task_type: str = "classification"
 upload_positive_class: str | None = None
 upload_negative_class: str | None = None
 upload_profile: dict | None = None
@@ -399,7 +439,7 @@ with st.sidebar:
             _run_loop_and_display(lambda: run_feature_loop(max_rounds=max_rounds), loop_spinner_text)
 
     else:
-        st.caption("Binary classification only for this version.")
+        st.caption("Binary classification or regression, from an uploaded CSV.")
         uploaded_file = st.file_uploader("CSV file", type="csv", key="upload_file")
         if uploaded_file is not None:
             upload_df = pd.read_csv(uploaded_file)
@@ -407,17 +447,36 @@ with st.sidebar:
             upload_target_column = st.selectbox(
                 "Target column", options=upload_df.columns.tolist(), key="upload_target_column"
             )
+            task_type_options = ["classification", "regression"]
+            suggested_task_type = _suggest_task_type(upload_df, upload_target_column)
+            upload_task_type = st.selectbox(
+                "Task type",
+                options=task_type_options,
+                index=task_type_options.index(suggested_task_type),
+                key="upload_task_type",
+                format_func=lambda t: "Classification (binary)" if t == "classification" else "Regression",
+                help="Auto-detected from the target column (numeric with many distinct values suggests "
+                "regression) - change it if the guess is wrong.",
+            )
             try:
-                classes = list(dataset.validate_binary_target(upload_df, upload_target_column))
+                if upload_task_type == "regression":
+                    dataset.validate_regression_target(upload_df, upload_target_column)
+                    classes: list[str] = []
+                else:
+                    classes = list(dataset.validate_binary_target(upload_df, upload_target_column))
             except ValueError as exc:
                 st.error(str(exc), icon=":material/error:")
             else:
-                upload_positive_class = st.selectbox(
-                    "Positive class (outcome of interest)",
-                    options=classes,
-                    key="upload_positive_class",
-                )
-                upload_negative_class = next(c for c in classes if c != upload_positive_class)
+                if upload_task_type == "classification":
+                    upload_positive_class = st.selectbox(
+                        "Positive class (outcome of interest)",
+                        options=classes,
+                        key="upload_positive_class",
+                    )
+                    upload_negative_class = next(c for c in classes if c != upload_positive_class)
+                else:
+                    upload_positive_class = ""
+                    upload_negative_class = ""
 
                 candidate_time_columns = detect_candidate_time_columns(upload_df, upload_target_column)
                 upload_time_column: str | None = None
@@ -433,7 +492,7 @@ with st.sidebar:
                     )
                     upload_time_column = None if time_choice == "None" else time_choice
 
-                upload_profile = profile_dataframe(upload_df, upload_target_column, upload_time_column)
+                upload_profile = profile_dataframe(upload_df, upload_target_column, upload_time_column, upload_task_type)
 
                 if st.button(
                     "Run baseline", icon=":material/play_arrow:", type="primary", key="run_button_upload"
@@ -441,7 +500,7 @@ with st.sidebar:
 
                     def _run_uploaded() -> RunReport:
                         uploaded = dataset.prepare_uploaded_dataset(
-                            upload_df, upload_target_column, upload_file_name, upload_time_column
+                            upload_df, upload_target_column, upload_file_name, upload_time_column, upload_task_type
                         )
                         return run_baseline_for(
                             train_path=uploaded.train_path,
@@ -451,6 +510,7 @@ with st.sidebar:
                             holdout=uploaded.holdout,
                             dataset_name=uploaded.dataset_name,
                             time_column=uploaded.time_column,
+                            task_type=upload_task_type,
                         )
 
                     _run_and_display(_run_uploaded, "Agent is writing and training a baseline...")
@@ -459,7 +519,7 @@ with st.sidebar:
 
                     def _run_uploaded_loop() -> LoopResult:
                         uploaded = dataset.prepare_uploaded_dataset(
-                            upload_df, upload_target_column, upload_file_name, upload_time_column
+                            upload_df, upload_target_column, upload_file_name, upload_time_column, upload_task_type
                         )
                         return run_feature_loop_for(
                             train_path=uploaded.train_path,
@@ -470,6 +530,7 @@ with st.sidebar:
                             dataset_name=uploaded.dataset_name,
                             max_rounds=max_rounds,
                             time_column=uploaded.time_column,
+                            task_type=upload_task_type,
                         )
 
                     _run_loop_and_display(_run_uploaded_loop, loop_spinner_text)
@@ -527,11 +588,11 @@ with st.sidebar:
                 attempts = sorted(loop_attempts_by_id[r.loop_id], key=lambda a: a.round_index)
                 winner = select_loop_winner(attempts)
                 round_word = f"round{'s' if len(attempts) != 1 else ''}"
-                label = (
-                    f"Loop · {len(attempts)} {round_word} · winner acc {winner.holdout_accuracy:.3f}"
-                    if winner is not None
-                    else f"Loop · {len(attempts)} {round_word} · no accepted result"
-                )
+                if winner is not None:
+                    winner_metric_label = "R²" if winner.task_type == "regression" else "acc"
+                    label = f"Loop · {len(attempts)} {round_word} · winner {winner_metric_label} {winner.holdout_accuracy:.3f}"
+                else:
+                    label = f"Loop · {len(attempts)} {round_word} · no accepted result"
                 entries.append((f"loop:{r.loop_id}", label))
             else:
                 entries.append((f"run:{r.run_id}", _run_label(r)))
@@ -567,9 +628,14 @@ with tab_run:
     if upload_profile is not None:
         with st.container(border=True):
             st.subheader(f"Dataset profile: {upload_file_name}", anchor=False)
+            if upload_profile["task_type"] == "regression":
+                t = upload_profile["target"]
+                target_summary_text = f"mean={t['mean']}, std={t['std']}, range=[{t['min']}, {t['max']}]"
+            else:
+                target_summary_text = f"balance: {upload_profile['target']['value_counts']}"
             st.caption(
                 f"{upload_profile['row_count']} rows, {len(upload_profile['features'])} feature columns. "
-                f"Target '{upload_target_column}' balance: {upload_profile['target']['value_counts']}"
+                f"Target '{upload_target_column}' {target_summary_text}"
             )
             if upload_profile["time_column"]:
                 st.caption(

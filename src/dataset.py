@@ -70,7 +70,9 @@ def _validate_split_classes(df: pd.DataFrame, target_column: str, train_idx: pd.
         )
 
 
-def _split_indices(df: pd.DataFrame, target_column: str, time_column: str | None = None) -> tuple[pd.Index, pd.Index]:
+def _split_indices(
+    df: pd.DataFrame, target_column: str, time_column: str | None = None, task_type: str = "classification"
+) -> tuple[pd.Index, pd.Index]:
     if time_column is not None:
         # Chronological split, not random: the earliest rows train, the
         # latest rows are held out - the shape a real deployment sees
@@ -83,6 +85,11 @@ def _split_indices(df: pd.DataFrame, target_column: str, time_column: str | None
         ordered_idx = df.index[_time_sort_key(df[time_column]).to_numpy().argsort(kind="stable")]
         split_point = round(len(ordered_idx) * (1 - HOLDOUT_FRACTION))
         train_idx, holdout_idx = ordered_idx[:split_point], ordered_idx[split_point:]
+    elif task_type == "regression":
+        # No stratify=: it assumes a small set of classes, which a
+        # continuous target doesn't have. A plain random split is the
+        # regression equivalent of the classification branch below.
+        train_idx, holdout_idx = train_test_split(df.index, test_size=HOLDOUT_FRACTION, random_state=SEED)
     else:
         train_idx, holdout_idx = train_test_split(
             df.index,
@@ -91,7 +98,12 @@ def _split_indices(df: pd.DataFrame, target_column: str, time_column: str | None
             stratify=df[target_column],
         )
 
-    _validate_split_classes(df, target_column, train_idx, holdout_idx)
+    if task_type != "regression":
+        # Class-membership checks don't apply to a continuous target - every
+        # regression split of reasonable size has "all classes" in both
+        # halves trivially, and value-uniqueness isn't the failure mode to
+        # guard against there anyway.
+        _validate_split_classes(df, target_column, train_idx, holdout_idx)
     return train_idx, holdout_idx
 
 
@@ -133,6 +145,22 @@ def validate_binary_target(df: pd.DataFrame, target_column: str) -> tuple[str, s
     return tuple(counts.index.astype(str))
 
 
+def validate_regression_target(df: pd.DataFrame, target_column: str) -> None:
+    """Checks a target column is usable for a regression baseline.
+
+    Raises ValueError with a message fit to show directly in the UI, the
+    same way validate_binary_target does for classification.
+    """
+    series = df[target_column].dropna()
+    if not pd.api.types.is_numeric_dtype(series):
+        raise ValueError(f'"{target_column}" is not numeric - pick a numeric column for a regression target.')
+    if series.nunique() <= 1:
+        raise ValueError(f'"{target_column}" has a single distinct value - there is nothing to predict.')
+    min_rows = 2 * MIN_ROWS_PER_CLASS
+    if len(series) < min_rows:
+        raise ValueError(f'"{target_column}" has only {len(series)} non-null row(s); needs at least {min_rows}.')
+
+
 @dataclass
 class UploadedDataset:
     train_path: Path
@@ -140,21 +168,27 @@ class UploadedDataset:
     target_column: str
     dataset_name: str
     time_column: str | None = None
+    task_type: str = "classification"
 
 
 def prepare_uploaded_dataset(
-    df: pd.DataFrame, target_column: str, dataset_name: str, time_column: str | None = None
+    df: pd.DataFrame,
+    target_column: str,
+    dataset_name: str,
+    time_column: str | None = None,
+    task_type: str = "classification",
 ) -> UploadedDataset:
     """Splits an uploaded dataset and writes only the train rows to disk.
 
     The holdout is returned in memory and never persisted - see this
-    module's docstring. Call validate_binary_target first; this function
-    assumes the target column is already known-good. time_column, if given,
-    must be one of profiling.detect_candidate_time_columns(df, target_column)
-    - this function trusts it's already known-parseable, the same way it
-    trusts target_column is already known-good, rather than re-validating.
+    module's docstring. Call validate_binary_target (classification) or
+    validate_regression_target first; this function assumes the target
+    column is already known-good. time_column, if given, must be one of
+    profiling.detect_candidate_time_columns(df, target_column) - this
+    function trusts it's already known-parseable, the same way it trusts
+    target_column is already known-good, rather than re-validating.
     """
-    train_idx, holdout_idx = _split_indices(df, target_column, time_column)
+    train_idx, holdout_idx = _split_indices(df, target_column, time_column, task_type)
     train_df = df.loc[train_idx].reset_index(drop=True)
     holdout_df = df.loc[holdout_idx].reset_index(drop=True)
 
@@ -169,6 +203,7 @@ def prepare_uploaded_dataset(
         target_column=target_column,
         dataset_name=dataset_name,
         time_column=time_column,
+        task_type=task_type,
     )
 
 

@@ -53,8 +53,53 @@ def detect_candidate_time_columns(df: pd.DataFrame, target_column: str) -> list[
     return candidates
 
 
-def profile_dataframe(df: pd.DataFrame, target_column: str, time_column: str | None = None) -> dict:
-    """Returns a JSON-serialisable summary: per-column stats plus target balance.
+def _classification_target_summary(target_series: pd.Series) -> dict:
+    value_counts = target_series.value_counts(dropna=True)
+    minority_class = None
+    minority_fraction = None
+    is_imbalanced = False
+    if len(value_counts) > 0:
+        minority_class = str(value_counts.idxmin())
+        minority_fraction = round(float(value_counts.min() / value_counts.sum()), 4)
+        is_imbalanced = minority_fraction < IMBALANCE_THRESHOLD
+    return {
+        "dtype": str(target_series.dtype),
+        "value_counts": {str(k): int(v) for k, v in value_counts.items()},
+        "missing_count": int(target_series.isna().sum()),
+        "minority_class": minority_class,
+        "minority_fraction": minority_fraction,
+        # Imbalance is a classification concept only - always False for
+        # regression, which is what keeps checks._check_missing_imbalance_correction
+        # silent on a regression run with no extra guard needed there.
+        "is_imbalanced": is_imbalanced,
+    }
+
+
+def _regression_target_summary(target_series: pd.Series) -> dict:
+    described = target_series.dropna().describe()
+    return {
+        "dtype": str(target_series.dtype),
+        "missing_count": int(target_series.isna().sum()),
+        "count": int(described.get("count", 0)),
+        "mean": round(float(described.get("mean", float("nan"))), 4),
+        "std": round(float(described.get("std", float("nan"))), 4),
+        "min": round(float(described.get("min", float("nan"))), 4),
+        "p25": round(float(described.get("25%", float("nan"))), 4),
+        "p50": round(float(described.get("50%", float("nan"))), 4),
+        "p75": round(float(described.get("75%", float("nan"))), 4),
+        "max": round(float(described.get("max", float("nan"))), 4),
+        # Regression has no minority-class notion - kept present and False
+        # so downstream code (checks.py) can read this key regardless of
+        # task_type without a separate branch.
+        "is_imbalanced": False,
+    }
+
+
+def profile_dataframe(
+    df: pd.DataFrame, target_column: str, time_column: str | None = None, task_type: str = "classification"
+) -> dict:
+    """Returns a JSON-serialisable summary: per-column stats plus target balance
+    (classification) or target distribution (regression).
 
     Reports missing values and exact-zero values as separate counts. A
     column can read as fully populated by isna() while really encoding
@@ -78,27 +123,16 @@ def profile_dataframe(df: pd.DataFrame, target_column: str, time_column: str | N
         }
 
     target_series = df[target_column]
-    value_counts = target_series.value_counts(dropna=True)
-    minority_class = None
-    minority_fraction = None
-    is_imbalanced = False
-    if len(value_counts) > 0:
-        minority_class = str(value_counts.idxmin())
-        minority_fraction = round(float(value_counts.min() / value_counts.sum()), 4)
-        is_imbalanced = minority_fraction < IMBALANCE_THRESHOLD
-    target_summary = {
-        "dtype": str(target_series.dtype),
-        "value_counts": {str(k): int(v) for k, v in value_counts.items()},
-        "missing_count": int(target_series.isna().sum()),
-        "minority_class": minority_class,
-        "minority_fraction": minority_fraction,
-        "is_imbalanced": is_imbalanced,
-    }
+    if task_type == "regression":
+        target_summary = _regression_target_summary(target_series)
+    else:
+        target_summary = _classification_target_summary(target_series)
 
     return {
         "row_count": len(df),
         "column_count": len(df.columns),
         "target_column": target_column,
+        "task_type": task_type,
         "target": target_summary,
         "features": feature_columns,
         "time_column": time_column,
@@ -108,17 +142,22 @@ def profile_dataframe(df: pd.DataFrame, target_column: str, time_column: str | N
 
 def format_profile_for_prompt(profile: dict) -> str:
     """Renders a profile as a compact text block for the agent's instruction."""
-    lines = [
-        f"Rows: {profile['row_count']}, feature columns: {len(profile['features'])}",
-        f"Target '{profile['target_column']}' balance: {profile['target']['value_counts']}",
-    ]
-    if profile["target"]["is_imbalanced"]:
+    lines = [f"Rows: {profile['row_count']}, feature columns: {len(profile['features'])}"]
+    if profile["task_type"] == "regression":
+        t = profile["target"]
         lines.append(
-            f"Target is IMBALANCED - minority class '{profile['target']['minority_class']}' is only "
-            f"{profile['target']['minority_fraction'] * 100:.1f}% of rows. Correct for this "
-            "(e.g. LightGBM's is_unbalance=True or scale_pos_weight, or scikit-learn's "
-            "class_weight) rather than training on the raw class counts."
+            f"Target '{profile['target_column']}' is continuous (regression): mean={t['mean']}, "
+            f"std={t['std']}, min={t['min']}, p25={t['p25']}, p50={t['p50']}, p75={t['p75']}, max={t['max']}"
         )
+    else:
+        lines.append(f"Target '{profile['target_column']}' balance: {profile['target']['value_counts']}")
+        if profile["target"]["is_imbalanced"]:
+            lines.append(
+                f"Target is IMBALANCED - minority class '{profile['target']['minority_class']}' is only "
+                f"{profile['target']['minority_fraction'] * 100:.1f}% of rows. Correct for this "
+                "(e.g. LightGBM's is_unbalance=True or scale_pos_weight, or scikit-learn's "
+                "class_weight) rather than training on the raw class counts."
+            )
     if profile["time_column"]:
         lines.append(
             f"This dataset is TIME-ORDERED by '{profile['time_column']}'. The train/holdout split "

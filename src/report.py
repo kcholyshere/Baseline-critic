@@ -8,7 +8,7 @@ import json
 import os
 import tempfile
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -73,6 +73,18 @@ class RunReport:
     round_index: int = 0
     revised_from_run_id: str | None = None
     time_column: str = ""
+    # "classification" or "regression". Defaulted so every run recorded
+    # before this field existed still loads via RunReport(**data) - list_runs
+    # silently skips a TypeError on unknown/missing fields, so a field with
+    # no default would make every historical run vanish from the UI with no
+    # error shown.
+    task_type: str = "classification"
+    # {"rmse": float, "mae": float, "r2": float} for a regression run, empty
+    # for classification - mirrors classification_report staying {} for a
+    # regression run. holdout_accuracy still holds the headline higher-is-
+    # better metric for both task types (accuracy, or r2 for regression) -
+    # feature_loop.select_loop_winner relies on that invariant.
+    regression_metrics: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)

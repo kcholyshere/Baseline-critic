@@ -71,14 +71,18 @@ def _check_column_order_instability(code: str) -> StaticFinding | None:
     return None
 
 
-def _check_missing_stratify(code: str, time_column: str | None) -> StaticFinding | None:
+def _check_missing_stratify(code: str, time_column: str | None, task_type: str = "classification") -> StaticFinding | None:
     """Silent whenever time_column is set: scikit-learn's train_test_split
     itself refuses stratify= together with shuffle=False, so a time-ordered
     dataset legitimately has no stratify= call - flagging its absence there
     would tell the critic the opposite of what _check_shuffled_time_series_split
     already tells it, the same kind of contradiction ADR-015 found confusing
-    the critic into ignoring a real finding."""
-    if time_column is not None:
+    the critic into ignoring a real finding.
+
+    Also silent for regression: stratify= assumes a small set of classes, a
+    continuous target has none, so a regression script legitimately omits
+    it too - the same reasoning as the time_column case above."""
+    if time_column is not None or task_type == "regression":
         return None
     if "train_test_split(" in code and "stratify" not in code:
         return StaticFinding(
@@ -111,6 +115,39 @@ def _check_shuffled_time_series_split(code: str, time_column: str | None) -> Sta
         "into validation, the classic temporal-leakage pattern.",
         category="temporal_leakage",
     )
+
+
+MIN_VALIDATION_FRACTION = 0.05
+_TEST_SIZE_PATTERN = re.compile(r"test_size\s*=\s*([0-9]*\.?[0-9]+)")
+
+
+def _check_tiny_validation_split(code: str) -> StaticFinding | None:
+    """Flags an internal train_test_split() whose test_size is too small to
+    reliably estimate generalisation error - task-type agnostic, unlike most
+    checks in this module: a validation split under MIN_VALIDATION_FRACTION
+    of rows is equally meaningless whether the metric behind it is accuracy
+    or RMSE. Only matches a fractional test_size (0 < value < 1), not an
+    absolute row count, since a bare int here is a different (valid) call
+    shape this check isn't meant to flag.
+
+    Regression has no static check standing behind degenerate_split
+    otherwise - _check_missing_stratify is silent there by design (stratify=
+    doesn't apply to a continuous target) - so without this check,
+    degenerate_split would have zero static evidence under regression and
+    src/critic.py's evidence-gate (ADR-016) would block every genuine LLM
+    reject naming it. This is what makes that category reachable for
+    regression at all, not an incidental addition."""
+    match = _TEST_SIZE_PATTERN.search(code)
+    if match is None:
+        return None
+    value = float(match.group(1))
+    if 0 < value < MIN_VALIDATION_FRACTION:
+        return StaticFinding(
+            f"train_test_split() uses test_size={value} - under {MIN_VALIDATION_FRACTION:.0%} of rows held "
+            "back for validation is too small to reliably estimate generalisation error.",
+            category="degenerate_split",
+        )
+    return None
 
 
 def _check_missing_imbalance_correction(code: str, is_imbalanced: bool) -> StaticFinding | None:
@@ -229,7 +266,9 @@ def _check_scored_on_training_rows(code: str) -> StaticFinding | None:
     return None
 
 
-def _check_val_holdout_gap(stdout: str, holdout_accuracy: float, scored_on_training_rows: bool) -> StaticFinding | None:
+def _check_val_holdout_gap(
+    stdout: str, holdout_accuracy: float, scored_on_training_rows: bool, task_type: str = "classification"
+) -> StaticFinding | None:
     """Two-sided, unlike the checks above it: a small gap is stated as a
     confirmed fact, not left silent, because the eval harness (Phase 5)
     found the critic treating any difference at all - even a ~0.002 gap
@@ -241,6 +280,14 @@ def _check_val_holdout_gap(stdout: str, holdout_accuracy: float, scored_on_train
     normal variance, not a defect signal - only a gap past
     VAL_HOLDOUT_GAP_THRESHOLD is.
 
+    Silent for regression: VAL_HOLDOUT_GAP_THRESHOLD is an absolute value
+    tuned for a 0-1 accuracy scale, meaningless against an unbounded,
+    scale-dependent metric like RMSE, and this check greps stdout for the
+    literal word "accuracy". score_mismatch stays covered for regression
+    without this check, via _check_scored_on_training_rows, which is purely
+    structural (matches the training-features variable name against the
+    final .predict() call) and needs no accuracy number at all.
+
     scored_on_training_rows suppresses the "normal, don't reject" half:
     when _check_scored_on_training_rows has already found the script
     scoring itself on training rows, the gap is not ordinary sampling
@@ -248,6 +295,8 @@ def _check_val_holdout_gap(stdout: str, holdout_accuracy: float, scored_on_train
     finding in the same prompt - the critic is told to trust static
     findings over its own reading, so two that disagree is worse than one
     that's silent."""
+    if task_type == "regression":
+        return None
     accuracy_lines = [line for line in stdout.splitlines() if "accuracy" in line.lower()]
     if not accuracy_lines:
         return None
@@ -277,16 +326,27 @@ def _check_val_holdout_gap(stdout: str, holdout_accuracy: float, scored_on_train
     )
 
 
-def _check_feature_target_correlation(train_path: Path, target_column: str) -> StaticFinding | None:
-    """Flags a feature whose correlation with the (binarised) target exceeds
+def _check_feature_target_correlation(
+    train_path: Path, target_column: str, task_type: str = "classification"
+) -> StaticFinding | None:
+    """Flags a feature whose correlation with the target exceeds
     LEAKAGE_CORRELATION_THRESHOLD - the classic "the answer got left in a
-    feature" pattern. Threshold picked with a wide, measured safety margin:
-    on the real Breast Cancer Wisconsin data, the strongest legitimate
-    predictor ("worst concave points") correlates at 0.786; the eval
-    harness's injected target_leakage column ("diagnosis_score" - label
-    plus small noise) correlates at 0.9998. 0.97 sits far above the former
-    and comfortably below the latter, so this only catches a near-duplicate
-    of the label, not a merely strong feature.
+    feature" pattern. Classification binarises the target first (two
+    values only); regression correlates directly against the continuous
+    target - no binarisation needed or meaningful there.
+
+    Threshold picked with a wide, measured safety margin, independently
+    verified against both task types' reference data:
+    - Classification (Breast Cancer Wisconsin): strongest legitimate
+      predictor ("worst concave points") correlates at 0.786; the eval
+      harness's injected target_leakage column ("diagnosis_score" - label
+      plus small noise) correlates at 0.9998.
+    - Regression (sklearn's bundled diabetes dataset): strongest legitimate
+      predictor ("bmi") correlates at 0.586; a target-plus-noise column at
+      5-15% noise correlates at 0.989-0.999.
+    0.97 sits far above the legitimate ceiling and comfortably below the
+    injected leak in both cases, so one shared constant covers both rather
+    than a second, unvalidated threshold.
 
     Deliberately does not attempt to catch temporal_leakage (ADR-010's
     injected target-rate encoding correlates at only 0.830 - too close to
@@ -300,10 +360,17 @@ def _check_feature_target_correlation(train_path: Path, target_column: str) -> S
         return None
     if target_column not in df.columns:
         return None
-    values = df[target_column].dropna().unique()
-    if len(values) != 2:
-        return None
-    label = (df[target_column] == values[0]).astype(int)
+
+    if task_type == "regression":
+        if not pd.api.types.is_numeric_dtype(df[target_column]):
+            return None
+        label = df[target_column].astype(float)
+    else:
+        values = df[target_column].dropna().unique()
+        if len(values) != 2:
+            return None
+        label = (df[target_column] == values[0]).astype(int)
+
     numeric_features = df.drop(columns=[target_column]).select_dtypes(include="number")
     if numeric_features.empty:
         return None
@@ -329,6 +396,7 @@ def _run_all_checks(
     holdout_accuracy: float,
     is_imbalanced: bool,
     time_column: str | None,
+    task_type: str,
 ) -> list[StaticFinding]:
     """Runs every static check once and returns the findings that fired -
     shared by run_static_checks (display text) and evidence_categories
@@ -336,17 +404,18 @@ def _run_all_checks(
     scored_on_training_rows_finding = _check_scored_on_training_rows(generated_code)
     checks = [
         _check_column_order_instability(generated_code),
-        _check_missing_stratify(generated_code, time_column),
+        _check_missing_stratify(generated_code, time_column, task_type),
         _check_missing_seed(generated_code),
         _check_missing_imbalance_correction(generated_code, is_imbalanced),
         _check_shuffled_time_series_split(generated_code, time_column),
+        _check_tiny_validation_split(generated_code),
         _check_foreign_file_path(generated_code, train_path),
         _check_public_dataset_import(generated_code),
         _check_target_column_referenced(generated_code, target_column),
         _check_target_excluded_from_features(generated_code, target_column),
-        _check_feature_target_correlation(train_path, target_column),
+        _check_feature_target_correlation(train_path, target_column, task_type),
         scored_on_training_rows_finding,
-        _check_val_holdout_gap(stdout, holdout_accuracy, scored_on_training_rows_finding is not None),
+        _check_val_holdout_gap(stdout, holdout_accuracy, scored_on_training_rows_finding is not None, task_type),
     ]
     return [finding for finding in checks if finding is not None]
 
@@ -359,6 +428,7 @@ def run_checks(
     holdout_accuracy: float,
     is_imbalanced: bool = False,
     time_column: str | None = None,
+    task_type: str = "classification",
 ) -> list[StaticFinding]:
     """Runs every static check once and returns the raw findings. Callers
     that need display text, evidence categories, or both (src/critic.py's
@@ -366,5 +436,5 @@ def run_checks(
     this one list rather than calling separate functions that would each
     re-run every check independently."""
     return _run_all_checks(
-        generated_code, train_path, target_column, stdout, holdout_accuracy, is_imbalanced, time_column
+        generated_code, train_path, target_column, stdout, holdout_accuracy, is_imbalanced, time_column, task_type
     )
