@@ -86,7 +86,10 @@ def _profile_df(profile: dict) -> pd.DataFrame:
 
 
 def _run_label(report: RunReport) -> str:
-    base = f"{report.timestamp[:19].replace('T', ' ')}  ·  acc {report.holdout_accuracy:.3f}"
+    timestamp = report.timestamp[:19].replace("T", " ")
+    if report.failed:
+        return f"{timestamp}  ·  failed"
+    base = f"{timestamp}  ·  acc {report.holdout_accuracy:.3f}"
     if report.critique is None:
         return base
     if report.critique["verdict"] == "accept":
@@ -130,6 +133,18 @@ def _run_loop_and_display(run_fn: Callable[[], LoopResult], spinner_text: str) -
 
 
 def _render_report(report: RunReport) -> None:
+    if report.failed:
+        # A failed run (sandbox budget exhaustion, the agent never calling
+        # run_training_code, etc.) is saved with holdout_accuracy=0.0 and
+        # classification_report={} - scoring never ran, so there is no
+        # report to render below this point (ADR-008's "always leave a
+        # trace" guarantee is about not losing the record, not about there
+        # being real results inside it).
+        st.error(f"This run failed before scoring: {report.failure_reason}", icon=":material/error:")
+        with st.expander("Sandbox stdout", icon=":material/terminal:"):
+            st.code(report.stdout or "(no output)", language="text")
+        return
+
     with st.container(horizontal=True):
         st.metric("Holdout accuracy", f"{report.holdout_accuracy:.1%}", border=True)
         st.metric("Train rows", report.train_rows, border=True)
@@ -566,18 +581,27 @@ with tab_run:
 
     selected_loop_id = st.session_state.get("selected_loop_id")
     if selected_loop_id:
-        loop_attempts = list_loop_attempts(selected_loop_id)
-        if loop_attempts:
-            # rounds_attempted isn't persisted (only produced live by
-            # run_feature_loop_async) - a crashed round leaves no run record
-            # at all, so len(loop_attempts) is the best count recoverable
-            # from disk on reload.
+        all_loop_runs = list_loop_attempts(selected_loop_id)
+        if all_loop_runs:
+            # A round that raised (sandbox budget exhaustion, agent never
+            # calling the tool, etc.) does leave a run record on disk -
+            # agent.py's except block saves a failure RunReport before
+            # re-raising (ADR-008) - but with an empty classification_report
+            # ({}), since scoring never ran. The live in-memory path
+            # (feature_loop.run_feature_loop_async) already excludes these
+            # from `attempts` via its own except/continue; reloading from
+            # disk must apply the same filter, or a failed round's empty
+            # report reaches _render_report and crashes on
+            # _classification_report_df's "support" column. rounds_attempted
+            # still counts every saved run, failed or not, matching what the
+            # live path reports.
+            loop_attempts = [r for r in all_loop_runs if not r.failed]
             _render_loop_result(
                 LoopResult(
                     loop_id=selected_loop_id,
                     attempts=loop_attempts,
                     winner=select_loop_winner(loop_attempts),
-                    rounds_attempted=len(loop_attempts),
+                    rounds_attempted=len(all_loop_runs),
                 )
             )
         else:
