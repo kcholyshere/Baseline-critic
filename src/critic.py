@@ -174,7 +174,15 @@ def _parse_verdict(text: str) -> _CriticVerdict | None:
     strips a markdown code fence if present, tolerates near-miss
     defect_category spelling (the model isn't grammar-constrained, so exact
     strings aren't guaranteed), returns None on any failure rather than
-    raising, matching what critique_run_async expects to retry against."""
+    raising, matching what critique_run_async expects to retry against.
+
+    Also rejects a self-inconsistent verdict: "reject" paired with
+    defect_category "none" (ADR-010/ADR-011 - the eval harness found the
+    model producing exactly this combination, with an empty defect string,
+    which pydantic's per-field validation can't catch since each field is
+    individually valid). Treated the same as an unparseable response, so
+    critique_run_async retries it rather than reporting a reject with no
+    named defect."""
     stripped = text.strip()
     if stripped.startswith("```"):
         stripped = stripped.split("```")[1]
@@ -183,7 +191,10 @@ def _parse_verdict(text: str) -> _CriticVerdict | None:
         data = json.loads(stripped)
         if "defect_category" in data:
             data["defect_category"] = _normalise_category(str(data["defect_category"]))
-        return _CriticVerdict.model_validate(data)
+        verdict = _CriticVerdict.model_validate(data)
+        if verdict.verdict == "reject" and verdict.defect_category == "none":
+            return None
+        return verdict
     except Exception:
         return None
 
