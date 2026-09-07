@@ -1,0 +1,29 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      # Bind-mounted, not loaded via compose's `env_file:` - Compose's own
+      # env-file parser does not strip quotes the way python-dotenv does
+      # (src/config.py's load_dotenv() call), and since env_file sets the
+      # variable before that call runs, load_dotenv()'s default
+      # override=False keeps Compose's unstripped, quoted value. A quoted
+      # LANGFUSE_BASE_URL ("https://cloud.langfuse.com" with the quotes kept
+      # literally) silently breaks Langfuse's OTLP export inside the
+      # container - confirmed by a real run. Mounting the file instead lets
+      # the app parse it exactly as it does on the host.
+      - ./.env:/app/.env:ro
+      # Run history, uploads, and eval fixtures live here (src/report.py,
+      # src/evaluation.py) - without this the container starts clean every
+      # time, silently discarding ADR-017's persistent run history.
+      - ./data:/app/data
+    environment:
+      # LiteLLM's ollama_chat provider reads this; its default,
+      # http://localhost:11434, would resolve to the container itself, not
+      # the host running Ollama. host.docker.internal is Docker Desktop's
+      # (macOS/Windows) name for the host; extra_hosts below adds the same
+      # mapping on Linux, where the daemon doesn't provide it by default.
+      - OLLAMA_API_BASE=http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

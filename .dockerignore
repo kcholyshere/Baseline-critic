@@ -1,0 +1,27 @@
+# Build context exclusions - keep the image small and the build context fast.
+# Runtime data belongs in the data/ volume mounted by docker-compose.yml, not
+# baked into the image (ADR: "Dockerise the app, ADR-001's sandbox decision
+# stays untouched").
+
+.venv/
+.git/
+.github/
+
+data/
+models/
+reports/
+notebooks/
+
+agent_docs/
+references/
+
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+.env
+.DS_Store
+*.egg-info/
