@@ -1,14 +1,12 @@
-"""Demo dashboard for the baseline agent (src/agent.py).
+"""Streamlit dashboard for the baseline agent (src/agent.py).
 
 Run with: uv run python -m streamlit run src/ui/app.py
 (python -m, not the bare `streamlit` binary - matches Research-agent's
 convention, see that project's src/ui/app.py for why.)
 
-Demo-scoped (2026-08-28): shows one agent's run, past and new, against
-either the built-in Breast Cancer Wisconsin dataset or an uploaded CSV.
-Not the planner/modeller/critic loop the proposal describes. The built-in
-demo dataset is always binary classification; an uploaded CSV can be either
-binary classification or regression (auto-detected, overridable).
+Upload a CSV, pick a target column, and the agent profiles it, writes and
+trains a baseline, and has the critic review the result - either binary
+classification or regression (auto-detected, overridable).
 """
 
 import asyncio
@@ -21,7 +19,7 @@ import streamlit as st
 from google.adk.models.lite_llm import LiteLlm
 
 from src import config, dataset, evaluation
-from src.agent import _resolve_model, rescore_run_async, run_baseline, run_baseline_for
+from src.agent import _resolve_model, rescore_run_async, run_baseline_for
 from src.feature_loop import (
     MAX_REVISION_ROUNDS,
     LoopResult,
@@ -31,7 +29,7 @@ from src.feature_loop import (
     select_loop_winner,
 )
 from src.profiling import detect_candidate_time_columns, profile_dataframe
-from src.report import RunReport, list_loop_attempts, list_rescorings, list_runs, save_rescoring
+from src.report import RunReport, list_loop_attempts, list_rescorings, list_runs, render_run_markdown, save_rescoring
 
 st.set_page_config(
     page_title="Baseline critic",
@@ -58,8 +56,7 @@ st.html("""
     margin: 0;
     font-size: 0.95rem;
 }
-.st-key-run_button button, .st-key-run_button_upload button,
-.st-key-run_loop_button button, .st-key-run_loop_button_upload button {
+.st-key-run_button_upload button, .st-key-run_loop_button_upload button {
     width: 100%;
     font-weight: 600;
 }
@@ -119,8 +116,8 @@ def _run_label(report: RunReport) -> str:
 def _run_and_display(run_fn: Callable[[], RunReport], spinner_text: str) -> None:
     """Shared scaffolding for both "Run baseline" buttons: spinner, call,
     stash the new run as selected, toast, rerun - or surface the error the
-    same way if the run fails. Kept in one place so the demo-dataset and
-    upload-CSV handlers can't drift into slightly different behaviour.
+    same way if the run fails. Kept in one place so every upload-CSV run
+    handler shares identical behaviour rather than drifting apart.
 
     Clears selected_loop_id so a freshly picked single run always wins over
     whatever loop was previously selected - the two selection states must
@@ -130,10 +127,6 @@ def _run_and_display(run_fn: Callable[[], RunReport], spinner_text: str) -> None
             new_report = run_fn()
         st.session_state["selected_run_id"] = new_report.run_id
         st.session_state["selected_loop_id"] = None
-        # Keeps the "Past runs" selectbox's own keyed value in sync - it
-        # ignores index= once its key already has a value, so setting
-        # selected_run_id alone wouldn't move the visible selection.
-        st.session_state["past_runs_select"] = f"run:{new_report.run_id}"
         st.toast("Run complete", icon=":material/check_circle:")
         st.rerun()
     except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
@@ -187,10 +180,6 @@ def _start_feature_loop(config: _ActiveLoopConfig, spinner_text: str) -> None:
         st.session_state["active_loop_state"] = state
         st.session_state["selected_loop_id"] = state.loop_id
         st.session_state["selected_run_id"] = None
-        # Keeps the "Past runs" selectbox's own keyed value in sync - see
-        # the comment on that selectbox's key= for why this is required,
-        # not optional, once round 1 completes (even a rejected round 1).
-        st.session_state["past_runs_select"] = f"loop:{state.loop_id}"
         if not state.attempts:
             # run_loop_round_async swallows a failed round's exception
             # internally rather than re-raising, so without this check a
@@ -217,7 +206,13 @@ def _start_feature_loop(config: _ActiveLoopConfig, spinner_text: str) -> None:
         st.error(f"Feature loop failed: {exc}", icon=":material/error:")
 
 
-def _render_report(report: RunReport) -> None:
+def _render_report(report: RunReport, key_prefix: str = "") -> None:
+    """key_prefix disambiguates this report's widget keys from another
+    render of the *same* run_id elsewhere on the page - the Run tab and the
+    Historical runs tab can both render the same run in one script
+    execution (e.g. an active loop's latest round, browsed at the same time
+    in Historical runs), and without a prefix that collides on
+    StreamlitDuplicateElementKey."""
     if report.failed:
         # A failed run (sandbox budget exhaustion, the agent never calling
         # run_training_code, etc.) is saved with holdout_accuracy=0.0 and
@@ -229,6 +224,15 @@ def _render_report(report: RunReport) -> None:
         with st.expander("Sandbox stdout", icon=":material/terminal:"):
             st.code(report.stdout or "(no output)", language="text")
         return
+
+    st.download_button(
+        "Download report (.md)",
+        data=render_run_markdown(report),
+        file_name=f"baseline-run-{report.run_id}.md",
+        mime="text/markdown",
+        icon=":material/download:",
+        key=f"{key_prefix}_download_report_{report.run_id}",
+    )
 
     with st.container(horizontal=True):
         if report.task_type == "regression":
@@ -261,7 +265,7 @@ def _render_report(report: RunReport) -> None:
                     color="red",
                 )
             if report.dataset_name == "breast_cancer_wisconsin":
-                if st.button("Re-score", icon=":material/refresh:", key=f"rescore_{report.run_id}"):
+                if st.button("Re-score", icon=":material/refresh:", key=f"{key_prefix}_rescore_{report.run_id}"):
                     with st.spinner("Re-running static checks and critic on the stored run...", show_time=True):
                         dataset.build_train_artifact()
                         new_critique = asyncio.run(rescore_run_async(report, dataset.TRAIN_PATH))
@@ -318,7 +322,7 @@ def _render_report(report: RunReport) -> None:
             if report.positive_class:
                 st.markdown(f"**Positive class**  \n{report.positive_class}")
             st.markdown(f"**Run ID**  \n`{report.run_id}`")
-            st.caption("Scored against a fixed holdout the agent never saw - see ADR-005.")
+            st.caption("Scored against a fixed holdout the agent never saw during training.")
             st.markdown("**Agent summary**")
             st.write(report.agent_summary)
 
@@ -339,7 +343,7 @@ def _render_report(report: RunReport) -> None:
         st.code(report.stdout or "(no output)", language="text")
 
 
-def _render_loop_result(loop_result: LoopResult) -> None:
+def _render_loop_result(loop_result: LoopResult, key_prefix: str = "") -> None:
     if loop_result.winner is not None:
         winner_metric_label = "Winner holdout R²" if loop_result.winner.task_type == "regression" else "Winner holdout accuracy"
         winner_metric_value = (
@@ -373,14 +377,13 @@ def _render_loop_result(loop_result: LoopResult) -> None:
     )
     for tab, attempt in zip(round_tabs, loop_result.attempts):
         with tab:
-            _render_report(attempt)
+            _render_report(attempt, key_prefix=key_prefix)
 
 
 def _render_evaluation_tab() -> None:
     st.caption(
-        "Phase 5: plants one known defect per defect_category into the Breast Cancer Wisconsin "
-        "dataset and measures the critic's detection rate against its false-alarm rate on a "
-        "clean run - see ADR-010 and references/project-proposal.md."
+        "Plants one known defect per defect category into a reference dataset and measures the "
+        "critic's detection rate against its false-alarm rate on a clean run."
     )
     if st.button("Run evaluation now", icon=":material/science:", key="run_evaluation_button"):
         with st.spinner(
@@ -473,7 +476,7 @@ def _render_evaluation_tab() -> None:
 st.html("""
 <div class="hero-banner">
   <h1>Baseline critic</h1>
-  <p>One agent trains a LightGBM baseline and is scored against a held-out split it never sees - the built-in demo dataset, or your own CSV.</p>
+  <p>One agent trains a LightGBM baseline on your CSV and is scored against a held-out split it never sees.</p>
 </div>
 """)
 
@@ -487,22 +490,15 @@ upload_profile: dict | None = None
 
 with st.sidebar:
     st.subheader("Run a baseline")
-    mode = st.radio(
-        "Dataset",
-        options=["Demo dataset", "Upload your own CSV"],
-        key="dataset_mode",
-        label_visibility="collapsed",
-    )
 
     active_loop = st.session_state.get("active_loop_state")
     loop_active = active_loop is not None
     if loop_active and st.session_state.get("selected_loop_id") != active_loop.loop_id:
         # The round-continuation "Finish loop now" button (main panel) only
-        # renders when the active loop is also the selected one. Without
-        # this sidebar fallback, switching the "Past runs" selection away
-        # from the active loop - or a round 1 that failed before saving
-        # anything to select - would leave every Start/Run button disabled
-        # with no way back short of restarting the app.
+        # renders when the active loop is also the one selected for the Run
+        # tab. Without this sidebar fallback, an active loop whose selection
+        # was cleared some other way would leave every Start/Run button
+        # disabled with no way back short of restarting the app.
         st.caption("A feature loop is in progress.")
         if st.button("Finish loop now", icon=":material/stop:", key="finish_loop_button_sidebar"):
             st.session_state["active_loop_config"] = None
@@ -521,234 +517,109 @@ with st.sidebar:
     )
     loop_spinner_text = f"Agent is running the feature-proposal loop ({max_rounds} round{'s' if max_rounds != 1 else ''})..."
 
-    if mode == "Demo dataset":
-        st.caption("Breast Cancer Wisconsin, target: diagnosis")
-        if st.button(
-            "Run baseline", icon=":material/play_arrow:", type="primary", key="run_button", disabled=loop_active
-        ):
-            _run_and_display(run_baseline, "Agent is writing and training a baseline...")
-        if st.button(
-            "Start feature loop", icon=":material/loop:", key="run_loop_button", disabled=loop_active
-        ):
-            dataset.build_train_artifact()
-            _start_feature_loop(
-                _ActiveLoopConfig(
-                    train_path=dataset.TRAIN_PATH,
-                    target_column=dataset.TARGET_COLUMN,
-                    positive_class="malignant",
-                    negative_class="benign",
-                    holdout=dataset.get_holdout(),
-                    dataset_name="breast_cancer_wisconsin",
-                    model=_resolve_model(None),
-                    max_rounds=max_rounds,
-                    time_column=None,
-                    task_type="classification",
-                ),
-                loop_spinner_text,
-            )
-
-    else:
-        st.caption("Binary classification or regression, from an uploaded CSV.")
-        uploaded_file = st.file_uploader("CSV file", type="csv", key="upload_file")
-        if uploaded_file is not None:
-            upload_df = pd.read_csv(uploaded_file)
-            upload_file_name = uploaded_file.name
-            upload_target_column = st.selectbox(
-                "Target column", options=upload_df.columns.tolist(), key="upload_target_column"
-            )
-            task_type_options = ["classification", "regression"]
-            suggested_task_type = _suggest_task_type(upload_df, upload_target_column)
-            upload_task_type = st.selectbox(
-                "Task type",
-                options=task_type_options,
-                index=task_type_options.index(suggested_task_type),
-                key="upload_task_type",
-                format_func=lambda t: "Classification (binary)" if t == "classification" else "Regression",
-                help="Auto-detected from the target column (numeric with many distinct values suggests "
-                "regression) - change it if the guess is wrong.",
-            )
-            try:
-                if upload_task_type == "regression":
-                    dataset.validate_regression_target(upload_df, upload_target_column)
-                    classes: list[str] = []
-                else:
-                    classes = list(dataset.validate_binary_target(upload_df, upload_target_column))
-            except ValueError as exc:
-                st.error(str(exc), icon=":material/error:")
+    st.caption("Binary classification or regression, from an uploaded CSV.")
+    uploaded_file = st.file_uploader("CSV file", type="csv", key="upload_file")
+    if uploaded_file is not None:
+        upload_df = pd.read_csv(uploaded_file)
+        upload_file_name = uploaded_file.name
+        upload_target_column = st.selectbox(
+            "Target column", options=upload_df.columns.tolist(), key="upload_target_column"
+        )
+        task_type_options = ["classification", "regression"]
+        suggested_task_type = _suggest_task_type(upload_df, upload_target_column)
+        upload_task_type = st.selectbox(
+            "Task type",
+            options=task_type_options,
+            index=task_type_options.index(suggested_task_type),
+            key="upload_task_type",
+            format_func=lambda t: "Classification (binary)" if t == "classification" else "Regression",
+            help="Auto-detected from the target column (numeric with many distinct values suggests "
+            "regression) - change it if the guess is wrong.",
+        )
+        try:
+            if upload_task_type == "regression":
+                dataset.validate_regression_target(upload_df, upload_target_column)
+                classes: list[str] = []
             else:
-                if upload_task_type == "classification":
-                    upload_positive_class = st.selectbox(
-                        "Positive class (outcome of interest)",
-                        options=classes,
-                        key="upload_positive_class",
-                    )
-                    upload_negative_class = next(c for c in classes if c != upload_positive_class)
-                else:
-                    upload_positive_class = ""
-                    upload_negative_class = ""
+                classes = list(dataset.validate_binary_target(upload_df, upload_target_column))
+        except ValueError as exc:
+            st.error(str(exc), icon=":material/error:")
+        else:
+            if upload_task_type == "classification":
+                upload_positive_class = st.selectbox(
+                    "Positive class (outcome of interest)",
+                    options=classes,
+                    key="upload_positive_class",
+                )
+                upload_negative_class = next(c for c in classes if c != upload_positive_class)
+            else:
+                upload_positive_class = ""
+                upload_negative_class = ""
 
-                candidate_time_columns = detect_candidate_time_columns(upload_df, upload_target_column)
-                upload_time_column: str | None = None
-                if candidate_time_columns:
-                    time_choice = st.selectbox(
-                        "Time column (optional - enables a chronological train/holdout split)",
-                        options=["None"] + candidate_time_columns,
-                        key="upload_time_column",
-                        help="When set, training data is the earliest rows and the holdout is the "
-                        "latest rows by this column, instead of a random split - the shape a real "
-                        "deployment sees, and it lets the critic check for a shuffled internal "
-                        "validation split (temporal leakage).",
-                    )
-                    upload_time_column = None if time_choice == "None" else time_choice
+            candidate_time_columns = detect_candidate_time_columns(upload_df, upload_target_column)
+            upload_time_column: str | None = None
+            if candidate_time_columns:
+                time_choice = st.selectbox(
+                    "Time column (optional - enables a chronological train/holdout split)",
+                    options=["None"] + candidate_time_columns,
+                    key="upload_time_column",
+                    help="When set, training data is the earliest rows and the holdout is the "
+                    "latest rows by this column, instead of a random split - the shape a real "
+                    "deployment sees, and it lets the critic check for a shuffled internal "
+                    "validation split (temporal leakage).",
+                )
+                upload_time_column = None if time_choice == "None" else time_choice
 
-                upload_profile = profile_dataframe(upload_df, upload_target_column, upload_time_column, upload_task_type)
+            upload_profile = profile_dataframe(upload_df, upload_target_column, upload_time_column, upload_task_type)
 
-                if st.button(
-                    "Run baseline",
-                    icon=":material/play_arrow:",
-                    type="primary",
-                    key="run_button_upload",
-                    disabled=loop_active,
-                ):
+            if st.button(
+                "Run baseline",
+                icon=":material/play_arrow:",
+                type="primary",
+                key="run_button_upload",
+                disabled=loop_active,
+            ):
 
-                    def _run_uploaded() -> RunReport:
-                        uploaded = dataset.prepare_uploaded_dataset(
-                            upload_df, upload_target_column, upload_file_name, upload_time_column, upload_task_type
-                        )
-                        return run_baseline_for(
-                            train_path=uploaded.train_path,
-                            target_column=upload_target_column,
-                            positive_class=upload_positive_class,
-                            negative_class=upload_negative_class,
-                            holdout=uploaded.holdout,
-                            dataset_name=uploaded.dataset_name,
-                            time_column=uploaded.time_column,
-                            task_type=upload_task_type,
-                        )
-
-                    _run_and_display(_run_uploaded, "Agent is writing and training a baseline...")
-
-                if st.button(
-                    "Start feature loop", icon=":material/loop:", key="run_loop_button_upload", disabled=loop_active
-                ):
+                def _run_uploaded() -> RunReport:
                     uploaded = dataset.prepare_uploaded_dataset(
                         upload_df, upload_target_column, upload_file_name, upload_time_column, upload_task_type
                     )
-                    _start_feature_loop(
-                        _ActiveLoopConfig(
-                            train_path=uploaded.train_path,
-                            target_column=upload_target_column,
-                            positive_class=upload_positive_class,
-                            negative_class=upload_negative_class,
-                            holdout=uploaded.holdout,
-                            dataset_name=uploaded.dataset_name,
-                            model=_resolve_model(None),
-                            max_rounds=max_rounds,
-                            time_column=uploaded.time_column,
-                            task_type=upload_task_type,
-                        ),
-                        loop_spinner_text,
+                    return run_baseline_for(
+                        train_path=uploaded.train_path,
+                        target_column=upload_target_column,
+                        positive_class=upload_positive_class,
+                        negative_class=upload_negative_class,
+                        holdout=uploaded.holdout,
+                        dataset_name=uploaded.dataset_name,
+                        time_column=uploaded.time_column,
+                        task_type=upload_task_type,
                     )
 
-    st.divider()
-    st.subheader("Runs")
+                _run_and_display(_run_uploaded, "Agent is writing and training a baseline...")
 
-    # dataset_id (a content hash, src/agent.py) is the real grouping key -
-    # dataset_name is just the human label, and two dataset_ids could in
-    # principle share one name. Pre-existing runs have dataset_id == "" and
-    # only ever show up under the "All datasets" default, never as their own
-    # filter option.
-    all_runs = list_runs()
-    resolved_names: dict[str, str] = {}
-    for r in all_runs:
-        if r.dataset_id:
-            resolved_names.setdefault(r.dataset_id, r.dataset_name or r.dataset_id)
+            if st.button(
+                "Start feature loop", icon=":material/loop:", key="run_loop_button_upload", disabled=loop_active
+            ):
+                uploaded = dataset.prepare_uploaded_dataset(
+                    upload_df, upload_target_column, upload_file_name, upload_time_column, upload_task_type
+                )
+                _start_feature_loop(
+                    _ActiveLoopConfig(
+                        train_path=uploaded.train_path,
+                        target_column=upload_target_column,
+                        positive_class=upload_positive_class,
+                        negative_class=upload_negative_class,
+                        holdout=uploaded.holdout,
+                        dataset_name=uploaded.dataset_name,
+                        model=_resolve_model(None),
+                        max_rounds=max_rounds,
+                        time_column=uploaded.time_column,
+                        task_type=upload_task_type,
+                    ),
+                    loop_spinner_text,
+                )
 
-    # Two distinct dataset_ids can resolve to the same displayed name -
-    # disambiguate only the colliding ones with a short id suffix, so the
-    # common (no-collision) case stays unlabelled noise-free.
-    name_counts: dict[str, int] = {}
-    for name in resolved_names.values():
-        name_counts[name] = name_counts.get(name, 0) + 1
-
-    dataset_labels = {"": "All datasets"}
-    for dataset_id, name in resolved_names.items():
-        if name_counts[name] > 1:
-            dataset_labels[dataset_id] = f"{name} ({dataset_id[:8]})"
-        else:
-            dataset_labels[dataset_id] = name
-    selected_dataset_id = st.selectbox(
-        "Dataset",
-        options=list(dataset_labels.keys()),
-        format_func=lambda ds_id: dataset_labels[ds_id],
-        key="runs_dataset_filter",
-    )
-
-    runs = list_runs(dataset_id=selected_dataset_id or None)
-    if runs:
-        # Sibling rounds of one loop collapse into a single selectable entry
-        # rather than appearing as separate flat rows.
-        loop_attempts_by_id: dict[str, list[RunReport]] = {}
-        for r in runs:
-            if r.loop_id:
-                loop_attempts_by_id.setdefault(r.loop_id, []).append(r)
-
-        entries: list[tuple[str, str]] = []
-        seen_loop_ids: set[str] = set()
-        for r in runs:
-            if r.loop_id:
-                if r.loop_id in seen_loop_ids:
-                    continue
-                seen_loop_ids.add(r.loop_id)
-                attempts = sorted(loop_attempts_by_id[r.loop_id], key=lambda a: a.round_index)
-                winner = select_loop_winner(attempts)
-                round_word = f"round{'s' if len(attempts) != 1 else ''}"
-                if winner is not None:
-                    winner_metric_label = "R²" if winner.task_type == "regression" else "acc"
-                    label = f"Loop · {len(attempts)} {round_word} · winner {winner_metric_label} {winner.holdout_accuracy:.3f}"
-                else:
-                    label = f"Loop · {len(attempts)} {round_word} · no accepted result"
-                entries.append((f"loop:{r.loop_id}", label))
-            else:
-                entries.append((f"run:{r.run_id}", _run_label(r)))
-
-        entry_labels = dict(entries)
-        entry_ids = [entry_id for entry_id, _ in entries]
-
-        # Seeds this widget's keyed session_state entry only if it doesn't
-        # exist yet (the true first-ever render) - never passed as index=
-        # alongside key= on every render, which Streamlit's own widget
-        # policy warns against and which was verified live (AppTest) to
-        # behave inconsistently: the selectbox would silently revert to
-        # index 0 on a rerun with no user interaction at all, hiding the
-        # round-continuation controls below since selected_loop_id no
-        # longer matched the loop actually in progress. Every place that
-        # sets selected_loop_id/selected_run_id from outside this widget's
-        # own on-change branch below must also set this key to match -
-        # see _run_and_display and _start_feature_loop.
-        if "past_runs_select" not in st.session_state:
-            if st.session_state.get("selected_loop_id"):
-                st.session_state["past_runs_select"] = f"loop:{st.session_state['selected_loop_id']}"
-            elif st.session_state.get("selected_run_id"):
-                st.session_state["past_runs_select"] = f"run:{st.session_state['selected_run_id']}"
-            else:
-                st.session_state["past_runs_select"] = entry_ids[0]
-
-        selected_entry_id = st.selectbox(
-            "Past runs",
-            options=entry_ids,
-            format_func=lambda entry_id: entry_labels[entry_id],
-            label_visibility="collapsed",
-            key="past_runs_select",
-        )
-        if selected_entry_id.startswith("loop:"):
-            st.session_state["selected_loop_id"] = selected_entry_id.removeprefix("loop:")
-            st.session_state["selected_run_id"] = None
-        else:
-            st.session_state["selected_run_id"] = selected_entry_id.removeprefix("run:")
-            st.session_state["selected_loop_id"] = None
-
-tab_run, tab_evaluation = st.tabs(["Run", "Evaluation harness"])
+tab_run, tab_history, tab_evaluation = st.tabs(["Run", "Historical runs", "Evaluation harness"])
 
 with tab_run:
     if upload_profile is not None:
@@ -794,7 +665,8 @@ with tab_run:
                     attempts=loop_attempts,
                     winner=select_loop_winner(loop_attempts),
                     rounds_attempted=len(all_loop_runs),
-                )
+                ),
+                key_prefix="run",
             )
 
             active_loop_state: LoopState | None = st.session_state.get("active_loop_state")
@@ -892,15 +764,132 @@ with tab_run:
                             st.rerun()
         else:
             st.info("Selected loop has no saved attempts.", icon=":material/info:")
-    elif not runs:
+    elif st.session_state.get("selected_run_id"):
+        selected_report = next(
+            (r for r in list_runs() if r.run_id == st.session_state["selected_run_id"]), None
+        )
+        if selected_report is not None:
+            _render_report(selected_report, key_prefix="run")
+    else:
+        st.info(
+            "Run a baseline from the sidebar to see it here. Past runs live in the "
+            "**Historical runs** tab.",
+            icon=":material/info:",
+        )
+
+with tab_history:
+    # dataset_id (a content hash, src/agent.py) is the real grouping key -
+    # dataset_name is just the human label, and two dataset_ids could in
+    # principle share one name. Pre-existing runs have dataset_id == "" and
+    # only ever show up under the "All datasets" default, never as their own
+    # filter option.
+    all_runs = list_runs()
+    if not all_runs:
         st.info(
             "No runs yet. Click **Run baseline** in the sidebar to train the first one.",
             icon=":material/info:",
         )
     else:
-        selected_id = st.session_state.get("selected_run_id", runs[0].run_id)
-        selected_report = next((r for r in runs if r.run_id == selected_id), runs[0])
-        _render_report(selected_report)
+        resolved_names: dict[str, str] = {}
+        for r in all_runs:
+            if r.dataset_id:
+                resolved_names.setdefault(r.dataset_id, r.dataset_name or r.dataset_id)
+
+        # Two distinct dataset_ids can resolve to the same displayed name -
+        # disambiguate only the colliding ones with a short id suffix, so the
+        # common (no-collision) case stays unlabelled noise-free.
+        name_counts: dict[str, int] = {}
+        for name in resolved_names.values():
+            name_counts[name] = name_counts.get(name, 0) + 1
+
+        dataset_labels = {"": "All datasets"}
+        for dataset_id, name in resolved_names.items():
+            if name_counts[name] > 1:
+                dataset_labels[dataset_id] = f"{name} ({dataset_id[:8]})"
+            else:
+                dataset_labels[dataset_id] = name
+        selected_dataset_id = st.selectbox(
+            "Dataset",
+            options=list(dataset_labels.keys()),
+            format_func=lambda ds_id: dataset_labels[ds_id],
+            key="history_dataset_filter",
+        )
+
+        history_runs = list_runs(dataset_id=selected_dataset_id or None)
+        if not history_runs:
+            st.info("No runs for this dataset.", icon=":material/info:")
+        else:
+            # Sibling rounds of one loop collapse into a single selectable
+            # entry rather than appearing as separate flat rows.
+            loop_attempts_by_id: dict[str, list[RunReport]] = {}
+            for r in history_runs:
+                if r.loop_id:
+                    loop_attempts_by_id.setdefault(r.loop_id, []).append(r)
+
+            entries: list[tuple[str, str]] = []
+            seen_loop_ids: set[str] = set()
+            for r in history_runs:
+                if r.loop_id:
+                    if r.loop_id in seen_loop_ids:
+                        continue
+                    seen_loop_ids.add(r.loop_id)
+                    attempts = sorted(loop_attempts_by_id[r.loop_id], key=lambda a: a.round_index)
+                    winner = select_loop_winner(attempts)
+                    round_word = f"round{'s' if len(attempts) != 1 else ''}"
+                    if winner is not None:
+                        winner_metric_label = "R²" if winner.task_type == "regression" else "acc"
+                        label = (
+                            f"Loop · {len(attempts)} {round_word} · winner "
+                            f"{winner_metric_label} {winner.holdout_accuracy:.3f}"
+                        )
+                    else:
+                        label = f"Loop · {len(attempts)} {round_word} · no accepted result"
+                    entries.append((f"loop:{r.loop_id}", label))
+                else:
+                    entries.append((f"run:{r.run_id}", _run_label(r)))
+
+            entry_labels = dict(entries)
+            entry_ids = [entry_id for entry_id, _ in entries]
+
+            # Seeds this widget's keyed session_state entry only if it doesn't
+            # exist yet (the true first-ever render) - never passed as index=
+            # alongside key= on every render, which Streamlit's own widget
+            # policy warns against and which was verified live (AppTest) to
+            # behave inconsistently: the selectbox would silently revert to
+            # index 0 on a rerun with no user interaction at all.
+            if "history_past_runs_select" not in st.session_state:
+                st.session_state["history_past_runs_select"] = entry_ids[0]
+            elif st.session_state["history_past_runs_select"] not in entry_ids:
+                # The dataset filter just changed to a set that no longer
+                # contains the previously selected entry.
+                st.session_state["history_past_runs_select"] = entry_ids[0]
+
+            selected_entry_id = st.selectbox(
+                "Past runs",
+                options=entry_ids,
+                format_func=lambda entry_id: entry_labels[entry_id],
+                label_visibility="collapsed",
+                key="history_past_runs_select",
+            )
+
+            st.divider()
+            if selected_entry_id.startswith("loop:"):
+                history_loop_id = selected_entry_id.removeprefix("loop:")
+                loop_attempts = [r for r in list_loop_attempts(history_loop_id) if not r.failed]
+                _render_loop_result(
+                    LoopResult(
+                        loop_id=history_loop_id,
+                        attempts=loop_attempts,
+                        winner=select_loop_winner(loop_attempts),
+                        rounds_attempted=len(list_loop_attempts(history_loop_id)),
+                    ),
+                    key_prefix="history",
+                )
+            else:
+                history_run_id = selected_entry_id.removeprefix("run:")
+                history_report = next((r for r in history_runs if r.run_id == history_run_id), None)
+                if history_report is not None:
+                    _render_report(history_report, key_prefix="history")
 
 with tab_evaluation:
     _render_evaluation_tab()

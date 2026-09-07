@@ -180,3 +180,95 @@ def list_rescorings(run_id: str | None = None) -> list[dict]:
     if run_id is not None:
         records = [r for r in records if r["run_id"] == run_id]
     return records
+
+
+def render_run_markdown(report: RunReport) -> str:
+    """Renders one run as a standalone markdown report - the same
+    information the UI shows for that run (src/ui/app.py's _render_report),
+    kept here so it stays a plain function the UI can hand to a download
+    button without re-deriving the shape of a RunReport itself."""
+    timestamp = report.timestamp[:19].replace("T", " ")
+    lines = ["# Baseline run report", "", f"Generated {timestamp} UTC · run ID `{report.run_id}`", ""]
+
+    if report.failed:
+        lines += [
+            "## Result",
+            "",
+            f"This run failed before scoring: {report.failure_reason}",
+            "",
+            "### Sandbox output",
+            "",
+            "```text",
+            report.stdout or "(no output)",
+            "```",
+        ]
+        return "\n".join(lines)
+
+    lines += ["## Dataset", ""]
+    lines.append(f"- Dataset: {report.dataset_name}")
+    lines.append(f"- Target column: {report.target_column}")
+    if report.positive_class:
+        lines.append(f"- Positive class: {report.positive_class}")
+    lines.append(f"- Train rows: {report.train_rows}")
+    lines.append(f"- Holdout rows: {report.holdout_rows}")
+    lines.append("")
+
+    lines += ["## Result", ""]
+    if report.task_type == "regression":
+        metrics = report.regression_metrics
+        lines.append(f"- Holdout R²: {report.holdout_accuracy:.4f}")
+        lines.append(f"- RMSE: {metrics.get('rmse', float('nan')):.4f}")
+        lines.append(f"- MAE: {metrics.get('mae', float('nan')):.4f}")
+    else:
+        lines.append(f"- Holdout accuracy: {report.holdout_accuracy:.1%}")
+        lines.append("")
+        lines.append("| class | precision | recall | f1 score | support |")
+        lines.append("|---|---|---|---|---|")
+        for label, values in report.classification_report.items():
+            if not isinstance(values, dict):
+                continue
+            lines.append(
+                f"| {label} | {values['precision']:.3f} | {values['recall']:.3f} | "
+                f"{values['f1-score']:.3f} | {int(values['support'])} |"
+            )
+    lines.append("")
+    lines.append(f"Run time: {report.duration_seconds:.1f}s")
+    lines.append("")
+
+    if report.critique is not None:
+        lines += ["## Critic verdict", ""]
+        if report.critique["verdict"] == "accept":
+            lines.append("**Accepted.**")
+        else:
+            lines.append(f"**Rejected - {report.critique['defect_category']}**")
+            lines.append("")
+            lines.append(report.critique["defect"])
+            lines.append("")
+            lines.append(f"Evidence: {report.critique['evidence']}")
+            if report.critique["static_findings"]:
+                lines.append("")
+                lines.append("Deterministic static-check findings:")
+                for finding in report.critique["static_findings"]:
+                    lines.append(f"- {finding}")
+        lines.append("")
+
+    lines += ["## Agent summary", "", report.agent_summary, ""]
+
+    lines += [
+        "## Generated training script",
+        "",
+        "```python",
+        report.generated_code,
+        "```",
+        "",
+    ]
+
+    lines += [
+        "## Sandbox output",
+        "",
+        "```text",
+        report.stdout or "(no output)",
+        "```",
+    ]
+
+    return "\n".join(lines)
