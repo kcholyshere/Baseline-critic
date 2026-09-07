@@ -2,7 +2,10 @@
 
 Filesystem and network access are NOT technically restricted here - isolation
 is by convention (a throwaway cwd) only, not enforcement. See ADR-001 for the
-accepted risk and the container fallback this defers to.
+accepted risk and the container fallback this defers to. src/guardrails.py
+adds a deterministic pre-execution scan in front of that still-unenforced
+boundary - a detection layer, not a fix to it; see that module's own
+docstring for exactly what it can and cannot catch.
 """
 
 import shutil
@@ -12,6 +15,8 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+
+from src.guardrails import scan_code
 
 TIMEOUT_SECONDS = 120
 # A module-level global, not a per-Streamlit-browser-session counter - it
@@ -58,6 +63,21 @@ def run_code(code: str) -> ExecutionResult:
                 f"Training budget of {MAX_CALLS_PER_SESSION} calls exhausted for this process."
             )
         _call_count += 1
+
+    findings = scan_code(code)
+    if findings:
+        # Blocked before scratch_dir even exists - a script the guardrail
+        # refuses never touches disk, but still costs one unit of the budget
+        # above, the same as any other call: a model stuck regenerating
+        # dangerous code should exhaust its budget rather than retry forever
+        # for free.
+        return ExecutionResult(
+            stdout="",
+            stderr=f"[blocked by guardrail] {'; '.join(f'{f.category}: {f.detail}' for f in findings)}",
+            returncode=-2,
+            timed_out=False,
+            artifacts={},
+        )
 
     scratch_dir = Path(tempfile.mkdtemp(prefix="baseline-critic-run-"))
     script_path = scratch_dir / "run.py"
