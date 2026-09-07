@@ -71,6 +71,13 @@ class RevisionContext:
     evidence: str
     previous_accuracy: float
     prior_summaries: list[str]
+    # Free-text instruction the person reviewing this loop's progress left
+    # for this round specifically (ADR-021, "talk with your data") - only
+    # ever set from round 2 onward, since it lives inside RevisionContext
+    # rather than as a sibling parameter: no RevisionContext exists yet on
+    # round 1, so "no instruction before a revision context exists" is a
+    # structural guarantee, not a convention a caller has to remember.
+    user_instruction: str = ""
 
 
 def _build_instruction(
@@ -157,6 +164,15 @@ least one concrete change you have not already tried:
 {task_specific_idea}
 Only resubmit an unchanged approach if you have genuinely already tried
 several of the above across your prior attempts and none of them helped.
+"""
+        if revision_context.user_instruction:
+            revision_block += f"""
+Additionally, the person reviewing this loop's progress left this
+instruction for this round specifically. Follow it as far as it is
+compatible with the requirements above, but do not compromise the script's
+required structure (excluded columns, label construction, the
+lightgbm.train() API) to satisfy it:
+"{revision_context.user_instruction}"
 """
     if is_regression:
         task_description = "a tabular regression task"
@@ -470,6 +486,7 @@ async def _run_baseline_async(
         report.round_index = round_index
         report.revised_from_run_id = revised_from_run_id
         report.time_column = time_column or ""
+        report.mid_loop_instruction = revision_context.user_instruction if revision_context is not None else ""
     except Exception as exc:
         # A permanently failed run (non-zero returncode, missing model.txt, or
         # the agent never calling the tool at all) must still leave a JSON
@@ -503,6 +520,7 @@ async def _run_baseline_async(
         failure_report.round_index = round_index
         failure_report.revised_from_run_id = revised_from_run_id
         failure_report.time_column = time_column or ""
+        failure_report.mid_loop_instruction = revision_context.user_instruction if revision_context is not None else ""
         save_run(failure_report)
         raise
 

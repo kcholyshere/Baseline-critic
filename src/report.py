@@ -85,6 +85,11 @@ class RunReport:
     # better metric for both task types (accuracy, or r2 for regression) -
     # feature_loop.select_loop_winner relies on that invariant.
     regression_metrics: dict = field(default_factory=dict)
+    # Free-text instruction the person reviewing this loop's progress left
+    # for this specific round, or "" if none was given (every round before
+    # this feature existed, and round 1 of any loop - see
+    # agent.RevisionContext.user_instruction, ADR-021).
+    mid_loop_instruction: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

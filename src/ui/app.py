@@ -12,18 +12,22 @@ binary classification or regression (auto-detected, overridable).
 """
 
 import asyncio
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import pandas as pd
 import streamlit as st
+from google.adk.models.lite_llm import LiteLlm
 
 from src import config, dataset, evaluation
-from src.agent import rescore_run_async, run_baseline, run_baseline_for
+from src.agent import _resolve_model, rescore_run_async, run_baseline, run_baseline_for
 from src.feature_loop import (
     MAX_REVISION_ROUNDS,
     LoopResult,
-    run_feature_loop,
-    run_feature_loop_for,
+    LoopState,
+    new_loop_state,
+    run_loop_round_async,
     select_loop_winner,
 )
 from src.profiling import detect_candidate_time_columns, profile_dataframe
@@ -126,23 +130,89 @@ def _run_and_display(run_fn: Callable[[], RunReport], spinner_text: str) -> None
             new_report = run_fn()
         st.session_state["selected_run_id"] = new_report.run_id
         st.session_state["selected_loop_id"] = None
+        # Keeps the "Past runs" selectbox's own keyed value in sync - it
+        # ignores index= once its key already has a value, so setting
+        # selected_run_id alone wouldn't move the visible selection.
+        st.session_state["past_runs_select"] = f"run:{new_report.run_id}"
         st.toast("Run complete", icon=":material/check_circle:")
         st.rerun()
     except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
         st.error(f"Run failed: {exc}", icon=":material/error:")
 
 
-def _run_loop_and_display(run_fn: Callable[[], LoopResult], spinner_text: str) -> None:
-    """Loop-shaped counterpart to _run_and_display - same scaffold, but for a
-    function returning LoopResult, and clearing selected_run_id the same way
-    the single-run path clears selected_loop_id."""
+@dataclass
+class _ActiveLoopConfig:
+    """Fixed config for one in-progress interactive feature loop, captured
+    once at "Start feature loop" and reused unchanged for every subsequent
+    round - in particular, an uploaded dataset's dataset.prepare_uploaded_dataset()
+    is called exactly once here, not per round, matching the invariant the
+    old single-call path already relied on (every round of one loop must
+    share the same content-hashed dataset_id, ADR-017)."""
+
+    train_path: Path
+    target_column: str
+    positive_class: str
+    negative_class: str
+    holdout: pd.DataFrame
+    dataset_name: str
+    model: str | LiteLlm
+    max_rounds: int
+    time_column: str | None
+    task_type: str
+
+
+def _start_feature_loop(config: _ActiveLoopConfig, spinner_text: str) -> None:
+    """Starts a new interactive feature loop: runs round 1 only (one round's
+    spinner, not the whole loop), then stashes the config and resulting
+    state in session_state for the round-by-round continuation UI. Mirrors
+    _run_and_display's error-surfacing/rerun shape."""
     try:
+        state = new_loop_state()
         with st.spinner(spinner_text, show_time=True):
-            loop_result = run_fn()
-        st.session_state["selected_loop_id"] = loop_result.loop_id
+            state = asyncio.run(
+                run_loop_round_async(
+                    state,
+                    train_path=config.train_path,
+                    target_column=config.target_column,
+                    positive_class=config.positive_class,
+                    negative_class=config.negative_class,
+                    holdout=config.holdout,
+                    dataset_name=config.dataset_name,
+                    model=config.model,
+                    time_column=config.time_column,
+                    task_type=config.task_type,
+                )
+            )
+        st.session_state["active_loop_config"] = config
+        st.session_state["active_loop_state"] = state
+        st.session_state["selected_loop_id"] = state.loop_id
         st.session_state["selected_run_id"] = None
-        st.toast("Feature loop complete", icon=":material/check_circle:")
-        st.rerun()
+        # Keeps the "Past runs" selectbox's own keyed value in sync - see
+        # the comment on that selectbox's key= for why this is required,
+        # not optional, once round 1 completes (even a rejected round 1).
+        st.session_state["past_runs_select"] = f"loop:{state.loop_id}"
+        if not state.attempts:
+            # run_loop_round_async swallows a failed round's exception
+            # internally rather than re-raising, so without this check a
+            # failed round 1 would fall through to the toast/rerun below and
+            # misreport itself as "Round 1 complete" - the same failure this
+            # file already guards against for round 2+ (see the "Run round
+            # N" button handler below, which this mirrors). Config/state are
+            # still stashed above so the sidebar's "Finish loop now" escape
+            # hatch and a round-2 retry both work from here.
+            failed_attempts = [r for r in list_loop_attempts(state.loop_id) if r.failed]
+            reason = failed_attempts[-1].failure_reason if failed_attempts else "unknown error"
+            if "budget" in reason.lower():
+                st.error(
+                    "Round 1 failed: sandbox budget exhausted for this session - further "
+                    "rounds will keep failing until the app is restarted.",
+                    icon=":material/error:",
+                )
+            else:
+                st.error(f"Round 1 failed: {reason}", icon=":material/error:")
+        else:
+            st.toast("Round 1 complete", icon=":material/check_circle:")
+            st.rerun()
     except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
         st.error(f"Feature loop failed: {exc}", icon=":material/error:")
 
@@ -289,6 +359,9 @@ def _render_loop_result(loop_result: LoopResult) -> None:
             icon=":material/gpp_maybe:",
         )
 
+    if not loop_result.attempts:
+        return
+
     # Tabs, not expanders - _render_report nests its own expanders, and
     # Streamlit doesn't allow an expander inside an expander.
     round_tabs = st.tabs(
@@ -421,6 +494,22 @@ with st.sidebar:
         label_visibility="collapsed",
     )
 
+    active_loop = st.session_state.get("active_loop_state")
+    loop_active = active_loop is not None
+    if loop_active and st.session_state.get("selected_loop_id") != active_loop.loop_id:
+        # The round-continuation "Finish loop now" button (main panel) only
+        # renders when the active loop is also the selected one. Without
+        # this sidebar fallback, switching the "Past runs" selection away
+        # from the active loop - or a round 1 that failed before saving
+        # anything to select - would leave every Start/Run button disabled
+        # with no way back short of restarting the app.
+        st.caption("A feature loop is in progress.")
+        if st.button("Finish loop now", icon=":material/stop:", key="finish_loop_button_sidebar"):
+            st.session_state["active_loop_config"] = None
+            st.session_state["active_loop_state"] = None
+            st.toast("Feature loop finished", icon=":material/check_circle:")
+            st.rerun()
+
     max_rounds = st.slider(
         "Feature loop rounds",
         min_value=1,
@@ -428,15 +517,35 @@ with st.sidebar:
         value=MAX_REVISION_ROUNDS,
         key="feature_loop_rounds",
         help="Each round is a real LLM call (roughly 1-3 minutes) - lower this for a quicker check.",
+        disabled=loop_active,
     )
     loop_spinner_text = f"Agent is running the feature-proposal loop ({max_rounds} round{'s' if max_rounds != 1 else ''})..."
 
     if mode == "Demo dataset":
         st.caption("Breast Cancer Wisconsin, target: diagnosis")
-        if st.button("Run baseline", icon=":material/play_arrow:", type="primary", key="run_button"):
+        if st.button(
+            "Run baseline", icon=":material/play_arrow:", type="primary", key="run_button", disabled=loop_active
+        ):
             _run_and_display(run_baseline, "Agent is writing and training a baseline...")
-        if st.button("Run feature loop", icon=":material/loop:", key="run_loop_button"):
-            _run_loop_and_display(lambda: run_feature_loop(max_rounds=max_rounds), loop_spinner_text)
+        if st.button(
+            "Start feature loop", icon=":material/loop:", key="run_loop_button", disabled=loop_active
+        ):
+            dataset.build_train_artifact()
+            _start_feature_loop(
+                _ActiveLoopConfig(
+                    train_path=dataset.TRAIN_PATH,
+                    target_column=dataset.TARGET_COLUMN,
+                    positive_class="malignant",
+                    negative_class="benign",
+                    holdout=dataset.get_holdout(),
+                    dataset_name="breast_cancer_wisconsin",
+                    model=_resolve_model(None),
+                    max_rounds=max_rounds,
+                    time_column=None,
+                    task_type="classification",
+                ),
+                loop_spinner_text,
+            )
 
     else:
         st.caption("Binary classification or regression, from an uploaded CSV.")
@@ -495,7 +604,11 @@ with st.sidebar:
                 upload_profile = profile_dataframe(upload_df, upload_target_column, upload_time_column, upload_task_type)
 
                 if st.button(
-                    "Run baseline", icon=":material/play_arrow:", type="primary", key="run_button_upload"
+                    "Run baseline",
+                    icon=":material/play_arrow:",
+                    type="primary",
+                    key="run_button_upload",
+                    disabled=loop_active,
                 ):
 
                     def _run_uploaded() -> RunReport:
@@ -515,25 +628,27 @@ with st.sidebar:
 
                     _run_and_display(_run_uploaded, "Agent is writing and training a baseline...")
 
-                if st.button("Run feature loop", icon=":material/loop:", key="run_loop_button_upload"):
-
-                    def _run_uploaded_loop() -> LoopResult:
-                        uploaded = dataset.prepare_uploaded_dataset(
-                            upload_df, upload_target_column, upload_file_name, upload_time_column, upload_task_type
-                        )
-                        return run_feature_loop_for(
+                if st.button(
+                    "Start feature loop", icon=":material/loop:", key="run_loop_button_upload", disabled=loop_active
+                ):
+                    uploaded = dataset.prepare_uploaded_dataset(
+                        upload_df, upload_target_column, upload_file_name, upload_time_column, upload_task_type
+                    )
+                    _start_feature_loop(
+                        _ActiveLoopConfig(
                             train_path=uploaded.train_path,
                             target_column=upload_target_column,
                             positive_class=upload_positive_class,
                             negative_class=upload_negative_class,
                             holdout=uploaded.holdout,
                             dataset_name=uploaded.dataset_name,
+                            model=_resolve_model(None),
                             max_rounds=max_rounds,
                             time_column=uploaded.time_column,
                             task_type=upload_task_type,
-                        )
-
-                    _run_loop_and_display(_run_uploaded_loop, loop_spinner_text)
+                        ),
+                        loop_spinner_text,
+                    )
 
     st.divider()
     st.subheader("Runs")
@@ -600,20 +715,31 @@ with st.sidebar:
         entry_labels = dict(entries)
         entry_ids = [entry_id for entry_id, _ in entries]
 
-        if st.session_state.get("selected_loop_id"):
-            default_entry_id = f"loop:{st.session_state['selected_loop_id']}"
-        elif st.session_state.get("selected_run_id"):
-            default_entry_id = f"run:{st.session_state['selected_run_id']}"
-        else:
-            default_entry_id = entry_ids[0]
-        default_index = entry_ids.index(default_entry_id) if default_entry_id in entry_ids else 0
+        # Seeds this widget's keyed session_state entry only if it doesn't
+        # exist yet (the true first-ever render) - never passed as index=
+        # alongside key= on every render, which Streamlit's own widget
+        # policy warns against and which was verified live (AppTest) to
+        # behave inconsistently: the selectbox would silently revert to
+        # index 0 on a rerun with no user interaction at all, hiding the
+        # round-continuation controls below since selected_loop_id no
+        # longer matched the loop actually in progress. Every place that
+        # sets selected_loop_id/selected_run_id from outside this widget's
+        # own on-change branch below must also set this key to match -
+        # see _run_and_display and _start_feature_loop.
+        if "past_runs_select" not in st.session_state:
+            if st.session_state.get("selected_loop_id"):
+                st.session_state["past_runs_select"] = f"loop:{st.session_state['selected_loop_id']}"
+            elif st.session_state.get("selected_run_id"):
+                st.session_state["past_runs_select"] = f"run:{st.session_state['selected_run_id']}"
+            else:
+                st.session_state["past_runs_select"] = entry_ids[0]
 
         selected_entry_id = st.selectbox(
             "Past runs",
             options=entry_ids,
             format_func=lambda entry_id: entry_labels[entry_id],
-            index=default_index,
             label_visibility="collapsed",
+            key="past_runs_select",
         )
         if selected_entry_id.startswith("loop:"):
             st.session_state["selected_loop_id"] = selected_entry_id.removeprefix("loop:")
@@ -670,6 +796,100 @@ with tab_run:
                     rounds_attempted=len(all_loop_runs),
                 )
             )
+
+            active_loop_state: LoopState | None = st.session_state.get("active_loop_state")
+            active_loop_config: _ActiveLoopConfig | None = st.session_state.get("active_loop_config")
+            if (
+                active_loop_state is not None
+                and active_loop_config is not None
+                and active_loop_state.loop_id == selected_loop_id
+            ):
+                next_round = active_loop_state.rounds_attempted + 1
+                if next_round > active_loop_config.max_rounds:
+                    st.session_state["active_loop_config"] = None
+                    st.session_state["active_loop_state"] = None
+                else:
+                    st.divider()
+                    st.caption(f"Round {next_round} of {active_loop_config.max_rounds} next")
+                    instruction_disabled = active_loop_state.last_successful is None
+                    if instruction_disabled:
+                        st.caption(
+                            "An instruction can only steer a revision of a previous attempt - "
+                            "no accepted or rejected round exists yet to revise from this instruction."
+                        )
+                    # A widget-keyed session_state entry cannot be reassigned
+                    # after that widget has already been instantiated in the
+                    # same script run (Streamlit raises StreamlitAPIException)
+                    # - the text_area below is that widget. So the "clear
+                    # after a successful round" request is deferred one rerun
+                    # via this flag, consumed here, before the widget renders.
+                    if st.session_state.pop("_clear_mid_loop_instruction", False):
+                        st.session_state["mid_loop_instruction_input"] = ""
+                    st.text_area(
+                        "Optional instruction for the next round",
+                        key="mid_loop_instruction_input",
+                        placeholder="e.g. try dropping the weakest feature, or tune num_leaves",
+                        disabled=instruction_disabled,
+                    )
+                    col_next, col_stop = st.columns(2)
+                    with col_next:
+                        if st.button(
+                            f"Run round {next_round}", icon=":material/play_arrow:", key="run_next_round_button"
+                        ):
+                            instruction_text = st.session_state.get("mid_loop_instruction_input", "").strip()[:500]
+                            try:
+                                with st.spinner(f"Agent is running round {next_round}...", show_time=True):
+                                    new_state = asyncio.run(
+                                        run_loop_round_async(
+                                            active_loop_state,
+                                            train_path=active_loop_config.train_path,
+                                            target_column=active_loop_config.target_column,
+                                            positive_class=active_loop_config.positive_class,
+                                            negative_class=active_loop_config.negative_class,
+                                            holdout=active_loop_config.holdout,
+                                            dataset_name=active_loop_config.dataset_name,
+                                            model=active_loop_config.model,
+                                            time_column=active_loop_config.time_column,
+                                            task_type=active_loop_config.task_type,
+                                            user_instruction=instruction_text,
+                                        )
+                                    )
+                                if len(new_state.attempts) == len(active_loop_state.attempts):
+                                    # run_loop_round_async swallows a failed round's exception
+                                    # internally and returns state unchanged - but
+                                    # _run_baseline_async already saved a failure RunReport to
+                                    # disk before that happened. Surface its real reason rather
+                                    # than a generic message, and call out the sandbox budget
+                                    # specifically (ADR-017's MAX_CALLS_PER_SESSION) since it's a
+                                    # process-wide ceiling now reachable mid-session - the next
+                                    # click will keep failing identically until the app restarts.
+                                    failed_attempts = [r for r in list_loop_attempts(selected_loop_id) if r.failed]
+                                    reason = failed_attempts[-1].failure_reason if failed_attempts else "unknown error"
+                                    if "budget" in reason.lower():
+                                        st.error(
+                                            f"Round {next_round} failed: sandbox budget exhausted for this "
+                                            "session - further rounds will keep failing until the app is "
+                                            "restarted.",
+                                            icon=":material/error:",
+                                        )
+                                    else:
+                                        st.error(f"Round {next_round} failed: {reason}", icon=":material/error:")
+                                else:
+                                    st.session_state["active_loop_state"] = new_state
+                                    st.session_state["_clear_mid_loop_instruction"] = True
+                                    if new_state.rounds_attempted >= active_loop_config.max_rounds:
+                                        st.session_state["active_loop_config"] = None
+                                        st.session_state["active_loop_state"] = None
+                                    st.toast(f"Round {next_round} complete", icon=":material/check_circle:")
+                                    st.rerun()
+                            except Exception as exc:  # noqa: BLE001
+                                st.error(f"Round {next_round} failed: {exc}", icon=":material/error:")
+                    with col_stop:
+                        if st.button("Finish loop now", icon=":material/stop:", key="finish_loop_button"):
+                            st.session_state["active_loop_config"] = None
+                            st.session_state["active_loop_state"] = None
+                            st.toast("Feature loop finished", icon=":material/check_circle:")
+                            st.rerun()
         else:
             st.info("Selected loop has no saved attempts.", icon=":material/info:")
     elif not runs:
